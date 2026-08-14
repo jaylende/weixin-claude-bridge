@@ -60,20 +60,46 @@ function persist(userId: string, messages: ChatMessage[]): void {
   saveChatFile(userId, messages);
 }
 
+export type ImageInput = { data: string; mediaType: string };
+
 /**
  * 向 Claude 提问并流式获取完整回复。
+ * 可附带图片（模型不支持视觉时自动降级为纯文本重试）。
  * 调用失败时回滚本次用户消息，抛出异常由调用方兜底。
  */
-export async function askClaude(userId: string, text: string): Promise<string> {
+export async function askClaude(
+  userId: string,
+  text: string,
+  images?: ImageInput[],
+): Promise<string> {
   const history = getHistory(userId);
-  history.push({ role: "user", content: text });
+  // 历史里只存文本（图片不落历史，避免文件膨胀）
+  const historyText = text.trim() || (images?.length ? "[图片消息]" : "");
+  history.push({ role: "user", content: historyText });
 
-  try {
+  const run = async (withImages: boolean): Promise<string> => {
+    const userContent = withImages && images?.length
+      ? [
+          ...images.map((img) => ({
+            type: "image" as const,
+            source: {
+              type: "base64" as const,
+              media_type: img.mediaType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+              data: img.data,
+            },
+          })),
+          { type: "text" as const, text: text.trim() || "请描述这张图片。" },
+        ]
+      : historyText;
+
     const stream = client.messages.stream({
       model: MODEL,
       max_tokens: 16000,
       system: SYSTEM_PROMPT,
-      messages: history,
+      messages: [
+        ...history.slice(0, -1),
+        { role: "user" as const, content: userContent },
+      ],
     });
 
     const final = await stream.finalMessage();
@@ -82,10 +108,21 @@ export async function askClaude(userId: string, text: string): Promise<string> {
       .map((b) => b.text)
       .join("")
       .trim();
+    if (!reply) throw new Error("模型返回了空回复");
+    return reply;
+  };
 
-    if (!reply) {
-      throw new Error("Claude 返回了空回复");
-    }
+  try {
+    const reply = images?.length
+      ? await run(true).catch((err) => {
+          // 模型不支持视觉（400）时降级为纯文本重试
+          if (err instanceof Anthropic.BadRequestError) {
+            logger.warn(`模型不支持图片输入，降级为纯文本: ${String(err).slice(0, 120)}`);
+            return run(false);
+          }
+          throw err;
+        })
+      : await run(false);
 
     history.push({ role: "assistant", content: reply });
     persist(userId, history);

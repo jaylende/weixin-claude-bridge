@@ -5,6 +5,10 @@ import path from "node:path";
 export const STATE_DIR = path.resolve(process.env.BRIDGE_STATE_DIR || "state");
 
 export const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
+/** 微信 CDN（媒体上传/下载） */
+export const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+/** 收到的媒体文件保存目录 */
+export const MEDIA_DIR = path.join(STATE_DIR, "media", "inbound");
 
 // ---------------------------------------------------------------------------
 // 通用 JSON 读写

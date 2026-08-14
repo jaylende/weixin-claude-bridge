@@ -12,6 +12,8 @@ import type { WeixinMessage, MessageItem, SendTypingReq, SendMessageReq } from "
 import { MessageItemType, MessageState, MessageType, TypingStatus } from "./vendor/types.js";
 import {
   DEFAULT_BASE_URL,
+  CDN_BASE_URL,
+  MEDIA_DIR,
   loadBot,
   loadSyncBuf,
   saveSyncBuf,
@@ -20,6 +22,11 @@ import {
   getContextToken,
 } from "./state.js";
 import { askClaude } from "./chat.js";
+import type { ImageInput } from "./chat.js";
+import { downloadMediaFromItem } from "./vendor/media/media-download.js";
+import { getMimeFromFilename } from "./vendor/media/mime.js";
+import fs from "node:fs";
+import path from "node:path";
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -105,16 +112,54 @@ async function sendTypingTo(
 // 消息处理
 // ---------------------------------------------------------------------------
 
-/** 提取 item_list 中第一条文本；无文本（纯媒体/工具调用）返回空串。 */
+/** 提取 item_list 中第一条文本；语音消息有转写文本时直接使用。 */
 function extractText(itemList?: MessageItem[]): string {
   if (!itemList?.length) return "";
   for (const item of itemList) {
     if (item.type === MessageItemType.TEXT && item.text_item?.text != null) {
       return String(item.text_item.text);
     }
+    if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
+      return String(item.voice_item.text);
+    }
   }
   return "";
 }
+
+function isMediaItem(item: MessageItem): boolean {
+  return (
+    item.type === MessageItemType.IMAGE ||
+    item.type === MessageItemType.VIDEO ||
+    item.type === MessageItemType.FILE ||
+    item.type === MessageItemType.VOICE
+  );
+}
+
+/** 收到的媒体文件落盘：state/media/inbound/ */
+async function saveMediaFile(
+  buffer: Buffer,
+  contentType?: string,
+  subdir?: string,
+  maxBytes?: number,
+  originalFilename?: string,
+): Promise<{ path: string }> {
+  if (maxBytes && buffer.length > maxBytes) {
+    throw new Error(`media too large: ${buffer.length} > ${maxBytes}`);
+  }
+  const dir = subdir ? path.join(path.dirname(MEDIA_DIR), subdir) : MEDIA_DIR;
+  await fs.promises.mkdir(dir, { recursive: true });
+  const ext = originalFilename
+    ? path.extname(originalFilename)
+    : contentType
+      ? `.${(contentType.split("/")[1] || "bin").slice(0, 10)}`
+      : ".bin";
+  const name = originalFilename ? path.basename(originalFilename) : `media-${Date.now()}${ext}`;
+  const filePath = path.join(dir, name);
+  await fs.promises.writeFile(filePath, buffer);
+  return { path: filePath };
+}
+
+const MAX_IMAGE_BYTES_FOR_MODEL = 5 * 1024 * 1024; // 模型视觉单图上限
 
 async function handleMessage(
   msg: WeixinMessage,
@@ -125,20 +170,66 @@ async function handleMessage(
   if (msg.message_type === MessageType.BOT) return; // 跳过 bot 自己的回显
 
   const text = extractText(msg.item_list).trim();
-  if (!text) return; // 媒体/空消息，最小版跳过
+
+  // 媒体：下载 + 解密（微信 CDN 内容为 AES-128-ECB 加密）
+  let mediaPath: string | undefined;
+  let mediaKind: "image" | "video" | "file" | "voice" | undefined;
+  const mediaItem = (msg.item_list ?? []).find(isMediaItem);
+  if (mediaItem) {
+    try {
+      const saved = await downloadMediaFromItem(mediaItem, {
+        cdnBaseUrl: CDN_BASE_URL,
+        saveMedia: saveMediaFile,
+        log: (m) => logger.info(m),
+        errLog: (m) => logger.error(m),
+        label: `from=${from}`,
+      });
+      if (saved.decryptedPicPath) { mediaPath = saved.decryptedPicPath; mediaKind = "image"; }
+      else if (saved.decryptedVideoPath) { mediaPath = saved.decryptedVideoPath; mediaKind = "video"; }
+      else if (saved.decryptedFilePath) { mediaPath = saved.decryptedFilePath; mediaKind = "file"; }
+      else if (saved.decryptedVoicePath) { mediaPath = saved.decryptedVoicePath; mediaKind = "voice"; }
+    } catch (err) {
+      logger.error(`媒体下载/解密失败 from=${from}: ${String(err)}`);
+    }
+  }
+
+  if (!text && !mediaPath) return;
+
+  // 构造给模型的输入：图片走视觉；其他媒体只告知保存路径
+  let prompt = text;
+  let images: ImageInput[] | undefined;
+  if (mediaKind === "image" && mediaPath) {
+    const size = fs.statSync(mediaPath).size;
+    if (size <= MAX_IMAGE_BYTES_FOR_MODEL) {
+      images = [{
+        data: fs.readFileSync(mediaPath).toString("base64"),
+        mediaType: getMimeFromFilename(mediaPath) || "image/jpeg",
+      }];
+    } else {
+      const note = `[用户发了一张 ${(size / 1024 / 1024).toFixed(1)}MB 的大图，已保存到 ${mediaPath}，当前模型无法查看]`;
+      prompt = prompt ? `${prompt}\n${note}` : note;
+    }
+  } else if (mediaPath) {
+    const kindLabel = (
+      { image: "图片", video: "视频", file: "文件", voice: "语音" } as const
+    )[mediaKind!];
+    const note = `[用户发了一个${kindLabel}，已保存到 ${mediaPath}]`;
+    prompt = prompt ? `${prompt}\n${note}` : note;
+  }
+  if (!prompt && images) prompt = ""; // askClaude 内会给纯图片消息补默认提问
 
   const contextToken = msg.context_token || getContextToken(from);
   if (msg.context_token) setContextToken(from, msg.context_token);
 
-  logger.info(`收到消息 from=${from}: ${text.slice(0, 100)}`);
+  logger.info(`收到消息 from=${from}: ${(text || "<媒体>").slice(0, 80)} media=${mediaKind ?? "无"}`);
 
   await sendTypingTo(opts, from, contextToken, TypingStatus.TYPING);
 
   let reply: string;
   try {
-    reply = await askClaude(from, text);
+    reply = await askClaude(from, prompt, images);
   } catch (err) {
-    logger.error(`Claude 调用失败 from=${from}: ${String(err)}`);
+    logger.error(`模型调用失败 from=${from}: ${String(err)}`);
     reply = "抱歉，出错了，请稍后再试。";
   }
 
