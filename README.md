@@ -59,9 +59,19 @@ src/
 
 ## 当前范围与后续计划
 
-已实现：文本对话（含上下文）、打字指示、长回复分块、token 失效检测、优雅退出。
+已实现：文本对话（含上下文）、打字指示、长回复分块、token 失效检测、优雅退出、
+图片/文件/语音/视频接收（CDN 下载 + AES-128-ECB 解密，存到 `state/media/inbound/`）、
+图片视觉理解（模型支持时；不支持自动降级为已保存提示）、媒体发送基础设施（`vendor/messaging/send-media.ts`）。
 
-未实现（可从原包按需移植 `src/cdn/*`）：图片/文件收发（CDN + AES-128-ECB 加解密）、多账号、群聊。
+未实现：机器人主动发图入口（Claude 工具）、多账号、群聊、语音转写（silk→wav 转码）。
+
+## 开机自启
+
+启动文件夹方案（无需管理员）：
+
+- 自启文件：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\weixin-claude-bridge.vbs`
+- 登录 Windows 后自动静默启动（无窗口），`start-bridge.cmd` 守护循环在桥退出后 10 秒自动重启
+- 运行日志：`state/bridge-run.log`；取消自启：删除该 .vbs 即可
 
 ## 免责声明
 
