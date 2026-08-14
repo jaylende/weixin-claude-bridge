@@ -23,6 +23,7 @@ import {
 } from "./state.js";
 import { askClaude } from "./chat.js";
 import type { ImageInput } from "./chat.js";
+import { startProgressServer, emitProgress } from "./progress.js";
 import { downloadMediaFromItem } from "./vendor/media/media-download.js";
 import { sendWeixinMediaFile } from "./vendor/messaging/send-media.js";
 import { getMimeFromFilename } from "./vendor/media/mime.js";
@@ -337,6 +338,10 @@ async function handleMessage(
   if (!prompt && images) prompt = ""; // askClaude 内会给纯图片消息补默认提问
 
   logger.info(`收到消息 from=${from}: ${(text || "<媒体>").slice(0, 80)} media=${mediaKind ?? "无"}`);
+  emitProgress(
+    "message_received",
+    `${text || "（媒体消息）"}\n媒体: ${mediaKind ?? "无"}${mediaPath ? " → " + mediaPath : ""}`,
+  );
 
   await sendTypingTo(opts, from, contextToken, TypingStatus.TYPING);
 
@@ -348,6 +353,7 @@ async function handleMessage(
     files = result.files;
   } catch (err) {
     logger.error(`模型调用失败 from=${from}: ${String(err)}`);
+    emitProgress("error", `模型调用失败：${String(err).slice(0, 300)}`);
     reply = "抱歉，出错了，请稍后再试。";
   }
 
@@ -358,6 +364,7 @@ async function handleMessage(
       body: buildTextSendBody(from, chunk, contextToken),
     });
   }
+  if (reply) emitProgress("reply_sent", reply.slice(0, 400));
 
   // 生成的文件逐个发回微信（已不存在的跳过——模型可能中途重命名/删除）
   for (const filePath of files) {
@@ -365,6 +372,7 @@ async function handleMessage(
       logger.warn(`跳过不存在的产物 from=${from} file=${filePath}`);
       continue;
     }
+    emitProgress("file_sending", path.basename(filePath));
     try {
       await sendWeixinMediaFile({
         filePath,
@@ -374,8 +382,10 @@ async function handleMessage(
         cdnBaseUrl: CDN_BASE_URL,
       });
       logger.info(`文件已发回微信 from=${from} file=${filePath}`);
+      emitProgress("file_sent", path.basename(filePath));
     } catch (err) {
       logger.error(`文件发送失败 from=${from} file=${filePath}: ${String(err)}`);
+      emitProgress("error", `文件发送失败 ${path.basename(filePath)}：${String(err).slice(0, 200)}`);
       await sendMessageApi({
         baseUrl: opts.baseUrl,
         token: opts.token,
@@ -461,6 +471,9 @@ export async function startBridge(): Promise<void> {
   const token = bot.token;
   const opts = { baseUrl, token };
 
+  // 实时进度面板：http://127.0.0.1:8787
+  startProgressServer(8787);
+
   if (!acquireInstanceLock()) {
     console.error("❌ 桥已在运行（state/bridge.pid 被占用）。若确认没有其他实例，删除该文件后重试。");
     process.exit(1);
@@ -484,6 +497,8 @@ export async function startBridge(): Promise<void> {
 
   logger.info(`bridge 已启动：botId=${bot.botId} baseUrl=${baseUrl}`);
   console.log("✅ 桥已启动，等待微信消息...（Ctrl+C 退出）");
+  console.log("📊 实时进度面板：http://127.0.0.1:8787");
+  emitProgress("bridge_started", `桥已启动（botId=${bot.botId}）`);
 
   // iLink 连接有效期约 24 小时，定时刷新（参考 weixin-ClawBot-API 的重连机制）
   const REFRESH_INTERVAL_MS = 22 * 3_600_000;

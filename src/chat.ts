@@ -8,6 +8,7 @@ import path from "node:path";
 import { logger } from "./vendor/logger.js";
 import { loadChatFile, saveChatFile } from "./state.js";
 import type { ChatMessage } from "./state.js";
+import { emitProgress } from "./progress.js";
 
 /** 模型：ANTHROPIC_MODEL 可覆盖，默认跟随官方推荐。 */
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5";
@@ -367,6 +368,7 @@ export async function askClaude(
       const results: Anthropic.ToolResultBlockParam[] = [];
       for (const block of final.content) {
         if (block.type !== "tool_use") continue;
+        emitProgress("tool_executing", `执行工具 ${block.name}…`);
         let resultText: string;
         try {
           if (block.name === "write_file") {
@@ -411,6 +413,7 @@ export async function askClaude(
   };
 
   const streamOnce = (messages: Anthropic.MessageParam[]) => {
+    emitProgress("model_calling", `第 ${messages.length} 条消息上下文，模型 ${MODEL}`);
     const stream = client.messages.stream({
       model: MODEL,
       max_tokens: 16000,
