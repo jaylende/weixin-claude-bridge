@@ -1,6 +1,9 @@
 import "./env.js";
 
-import { loadBot, saveBot, DEFAULT_BASE_URL } from "./state.js";
+import path from "node:path";
+import QRCode from "qrcode";
+
+import { loadBot, saveBot, STATE_DIR, DEFAULT_BASE_URL } from "./state.js";
 import {
   startWeixinLoginWithQr,
   waitForWeixinLogin,
@@ -27,6 +30,15 @@ async function login(): Promise<void> {
 
   console.log("用手机微信扫描以下二维码：\n");
   await displayQRCode(start.qrcodeUrl);
+  // 同时保存 PNG 图片，方便在图形界面打开后用手机扫
+  try {
+    const qrPath = path.join(STATE_DIR, "login-qr.png");
+    await QRCode.toFile(qrPath, start.qrcodeUrl, { width: 480, margin: 2 });
+    console.log(`\n📱 二维码图片已保存到: ${qrPath}`);
+    console.log("   打开这个图片文件，用手机微信扫描屏幕上的二维码即可。\n");
+  } catch (err) {
+    console.log("(二维码图片生成失败，请使用上方链接)");
+  }
   console.log("\n等待扫码确认（最长 8 分钟）...\n");
 
   const result = await waitForWeixinLogin({
