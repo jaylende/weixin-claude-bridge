@@ -62,9 +62,56 @@ function persist(userId: string, messages: ChatMessage[]): void {
 
 export type ImageInput = { data: string; mediaType: string };
 
+// ---------------------------------------------------------------------------
+// 外部视觉模型（DeepSeek 等纯文本模型无视觉能力时的补充通道）
+// 默认智谱 GLM-4V-Flash（永久免费）：图片 → 文字描述 → 主模型
+// ---------------------------------------------------------------------------
+
+const VISION_API_KEY = process.env.VISION_API_KEY;
+const VISION_BASE_URL = process.env.VISION_BASE_URL || "https://open.bigmodel.cn/api/paas/v4";
+const VISION_MODEL = process.env.VISION_MODEL || "glm-4v-flash";
+
+/** 调用 OpenAI 兼容格式的视觉模型，把图片转成文字描述。 */
+async function describeImages(images: ImageInput[]): Promise<string> {
+  const res = await fetch(`${VISION_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${VISION_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: VISION_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: [
+            ...images.map((img) => ({
+              type: "image_url",
+              image_url: { url: `data:${img.mediaType};base64,${img.data}` },
+            })),
+            {
+              type: "text",
+              text: "请详细描述这张图片的内容，包括其中的文字、场景、人物、物品等所有可见信息。",
+            },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`视觉模型调用失败: HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  const desc = data.choices?.[0]?.message?.content?.trim();
+  if (!desc) throw new Error("视觉模型返回空描述");
+  return desc;
+}
+
 /**
  * 向 Claude 提问并流式获取完整回复。
- * 可附带图片（模型不支持视觉时自动降级为纯文本重试）。
+ * 带图片时的降级链：原生视觉（模型支持）→ 外部视觉模型转描述（配了 VISION_API_KEY）
+ * → 纯文本提示（都不行）。
  * 调用失败时回滚本次用户消息，抛出异常由调用方兜底。
  */
 export async function askClaude(
@@ -77,7 +124,7 @@ export async function askClaude(
   const historyText = text.trim() || (images?.length ? "[图片消息]" : "");
   history.push({ role: "user", content: historyText });
 
-  const run = async (withImages: boolean): Promise<string> => {
+  const run = async (withImages: boolean, overrideText?: string): Promise<string> => {
     const userContent = withImages && images?.length
       ? [
           ...images.map((img) => ({
@@ -90,7 +137,7 @@ export async function askClaude(
           })),
           { type: "text" as const, text: text.trim() || "请描述这张图片。" },
         ]
-      : historyText;
+      : (overrideText ?? historyText);
 
     const stream = client.messages.stream({
       model: MODEL,
@@ -113,16 +160,27 @@ export async function askClaude(
   };
 
   try {
-    const reply = images?.length
-      ? await run(true).catch((err) => {
-          // 模型不支持视觉（400）时降级为纯文本重试
-          if (err instanceof Anthropic.BadRequestError) {
-            logger.warn(`模型不支持图片输入，降级为纯文本: ${String(err).slice(0, 120)}`);
-            return run(false);
+    let reply: string;
+    if (images?.length) {
+      reply = await run(true).catch(async (err) => {
+        // 模型不支持视觉（400）
+        if (err instanceof Anthropic.BadRequestError) {
+          if (VISION_API_KEY) {
+            logger.info("主模型无视觉能力，改用外部视觉模型（" + VISION_MODEL + "）描述图片");
+            const desc = await describeImages(images);
+            const combined = [historyText, `[用户发来的图片内容描述]\n${desc}`]
+              .filter(Boolean)
+              .join("\n\n");
+            return run(false, combined);
           }
-          throw err;
-        })
-      : await run(false);
+          logger.warn(`主模型不支持图片且未配置 VISION_API_KEY，降级为纯文本: ${String(err).slice(0, 120)}`);
+          return run(false);
+        }
+        throw err;
+      });
+    } else {
+      reply = await run(false);
+    }
 
     history.push({ role: "assistant", content: reply });
     persist(userId, history);
