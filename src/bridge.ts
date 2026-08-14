@@ -29,6 +29,8 @@ import fs from "node:fs";
 import path from "node:path";
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
+/** 微信 getupdates 会对同一条消息推送多次（图片尤其明显），按消息 ID 去重。 */
+const MAX_RECENT_MESSAGE_KEYS = 500;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
@@ -252,6 +254,62 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---------------------------------------------------------------------------
+// 单实例锁 + 消息去重
+// ---------------------------------------------------------------------------
+
+const LOCK_FILE = path.join(process.env.BRIDGE_STATE_DIR || "state", "bridge.pid");
+
+function acquireInstanceLock(): boolean {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const pid = Number(fs.readFileSync(LOCK_FILE, "utf-8"));
+      if (pid) {
+        try {
+          process.kill(pid, 0); // 进程还活着
+          return false;
+        } catch {
+          // 锁文件是陈旧残留，继续获取
+        }
+      }
+    }
+  } catch {
+    // 读取失败按无锁处理
+  }
+  fs.writeFileSync(LOCK_FILE, String(process.pid));
+  return true;
+}
+
+function releaseInstanceLock(): void {
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch {
+    // best-effort
+  }
+}
+
+const recentMessageKeys = new Set<string>();
+
+/** 消息去重 key；无 ID 的消息返回 null（不去重）。 */
+function dedupeKey(msg: WeixinMessage): string | null {
+  if (msg.message_id) return `mid:${msg.message_id}`;
+  if (msg.seq != null && msg.create_time_ms) return `seq:${msg.seq}:${msg.create_time_ms}`;
+  return null;
+}
+
+/** 若消息已处理过返回 true。 */
+function isDuplicate(msg: WeixinMessage): boolean {
+  const key = dedupeKey(msg);
+  if (!key) return false;
+  if (recentMessageKeys.has(key)) return true;
+  recentMessageKeys.add(key);
+  if (recentMessageKeys.size > MAX_RECENT_MESSAGE_KEYS) {
+    const first = recentMessageKeys.values().next().value;
+    if (first !== undefined) recentMessageKeys.delete(first);
+  }
+  return false;
+}
+
 export async function startBridge(): Promise<void> {
   const bot = loadBot();
   if (!bot?.token) {
@@ -262,6 +320,11 @@ export async function startBridge(): Promise<void> {
   const token = bot.token;
   const opts = { baseUrl, token };
 
+  if (!acquireInstanceLock()) {
+    console.error("❌ 桥已在运行（state/bridge.pid 被占用）。若确认没有其他实例，删除该文件后重试。");
+    process.exit(1);
+  }
+
   restoreContextTokens();
 
   await notifyStart(opts).catch(() => {
@@ -270,6 +333,7 @@ export async function startBridge(): Promise<void> {
 
   const shutdown = (): void => {
     logger.info("收到退出信号，通知微信服务端停止...");
+    releaseInstanceLock();
     void notifyStop(opts).catch(() => {});
     process.exit(0);
   };
@@ -328,6 +392,10 @@ export async function startBridge(): Promise<void> {
       }
 
       for (const msg of resp.msgs ?? []) {
+        if (isDuplicate(msg)) {
+          logger.debug(`跳过重复消息 from=${msg.from_user_id} key=${dedupeKey(msg)}`);
+          continue;
+        }
         try {
           await handleMessage(msg, opts);
         } catch (err) {
