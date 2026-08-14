@@ -139,6 +139,28 @@ function isMediaItem(item: MessageItem): boolean {
   );
 }
 
+/** 纯媒体消息无附带要求时的引导回复（合并窗口内没有文字消息到达）。 */
+async function replyMediaReceived(
+  from: string,
+  mediaPath: string,
+  mediaKind: string,
+  opts: { baseUrl: string; token: string },
+): Promise<void> {
+  const label = (
+    { image: "图片", video: "视频", file: "文件", voice: "语音" } as Record<string, string>
+  )[mediaKind] ?? "文件";
+  const text = `已收到${label}（${path.basename(mediaPath)}）。请告诉我你想对它做什么？`;
+  try {
+    await sendMessageApi({
+      baseUrl: opts.baseUrl,
+      token: opts.token,
+      body: buildTextSendBody(from, text, getContextToken(from)),
+    });
+  } catch (err) {
+    logger.warn(`引导回复发送失败 from=${from}: ${String(err)}`);
+  }
+}
+
 /** 收到的媒体文件落盘：state/media/inbound/ */
 async function saveMediaFile(
   buffer: Buffer,
@@ -168,6 +190,16 @@ const MAX_IMAGE_BYTES_FOR_MODEL = 5 * 1024 * 1024; // 模型视觉单图上限
 /** 最近收到的文件（每用户），供后续纯文本消息中的「这个文件」指代。 */
 const recentInboundFiles = new Map<string, { path: string; at: number }>();
 const RECENT_FILE_WINDOW_MS = 10 * 60_000; // 10 分钟内有效
+
+/**
+ * 待合并的媒体消息：微信把「文件+要求」拆成两条消息（文件在前），
+ * 文件消息先挂起 3.5 秒，等文字要求到达后合并成一次处理，避免重复回复。
+ */
+const pendingMediaByUser = new Map<
+  string,
+  { mediaPath: string; mediaKind: "image" | "video" | "file" | "voice"; contextToken?: string; timer: NodeJS.Timeout }
+>();
+const MEDIA_MERGE_WINDOW_MS = 3500;
 
 async function handleMessage(
   msg: WeixinMessage,
@@ -203,9 +235,34 @@ async function handleMessage(
 
   if (!text && !mediaPath) return;
 
+  const contextToken = msg.context_token || getContextToken(from);
+  if (msg.context_token) setContextToken(from, msg.context_token);
+
   // 记录最近收到的文件，供后续文字消息指代
   if (mediaPath && mediaKind !== "image") {
     recentInboundFiles.set(from, { path: mediaPath, at: Date.now() });
+  }
+
+  // 纯媒体消息：挂起 3.5 秒等文字要求，合并成一次处理（微信把「文件+要求」拆成两条消息）
+  if (mediaPath && !text) {
+    const pending = { mediaPath, mediaKind: mediaKind!, contextToken };
+    const timer = setTimeout(() => {
+      pendingMediaByUser.delete(from);
+      void replyMediaReceived(from, pending.mediaPath, pending.mediaKind, opts);
+    }, MEDIA_MERGE_WINDOW_MS);
+    pendingMediaByUser.set(from, { ...pending, timer });
+    return;
+  }
+
+  // 文字消息：若 3.5 秒内有挂起的媒体消息，合并进来一起处理
+  if (text && !mediaPath) {
+    const pending = pendingMediaByUser.get(from);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingMediaByUser.delete(from);
+      mediaPath = pending.mediaPath;
+      mediaKind = pending.mediaKind;
+    }
   }
 
   // 构造给模型的输入：图片走视觉；其他媒体只告知保存路径
@@ -236,9 +293,6 @@ async function handleMessage(
     }
   }
   if (!prompt && images) prompt = ""; // askClaude 内会给纯图片消息补默认提问
-
-  const contextToken = msg.context_token || getContextToken(from);
-  if (msg.context_token) setContextToken(from, msg.context_token);
 
   logger.info(`收到消息 from=${from}: ${(text || "<媒体>").slice(0, 80)} media=${mediaKind ?? "无"}`);
 
