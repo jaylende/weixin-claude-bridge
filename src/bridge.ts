@@ -28,6 +28,7 @@ import { sendWeixinMediaFile } from "./vendor/messaging/send-media.js";
 import { getMimeFromFilename } from "./vendor/media/mime.js";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 /** 微信 getupdates 会对同一条消息推送多次（图片尤其明显），按消息 ID 去重。 */
@@ -161,6 +162,42 @@ async function replyMediaReceived(
   }
 }
 
+/** LibreOffice 无头转换（旧版 Office 格式 → 新版，供模型读取）。 */
+const SOFFICE = "C:\\Program Files\\LibreOffice\\program\\soffice.exe";
+const CONVERTED_DIR = path.join(process.env.BRIDGE_STATE_DIR || "state", "converted");
+const LEGACY_OFFICE_EXTS: Record<string, string> = {
+  ".doc": "docx",
+  ".xls": "xlsx",
+  ".ppt": "pptx",
+  ".wps": "docx",
+};
+
+/**
+ * 旧版 Office 格式（.doc/.xls/.ppt/.wps）用 LibreOffice 转为新格式，
+ * 返回转换后的路径；其他格式或转换失败返回原路径。
+ */
+function convertLegacyOfficeFile(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const target = LEGACY_OFFICE_EXTS[ext];
+  if (!target || !fs.existsSync(SOFFICE)) return filePath;
+  try {
+    fs.mkdirSync(CONVERTED_DIR, { recursive: true });
+    execFileSync(
+      SOFFICE,
+      ["--headless", "--convert-to", target, "--outdir", CONVERTED_DIR, filePath],
+      { timeout: 120_000, windowsHide: true },
+    );
+    const converted = path.join(CONVERTED_DIR, path.basename(filePath, ext) + "." + target);
+    if (fs.existsSync(converted)) {
+      logger.info(`旧格式已转换: ${filePath} -> ${converted}`);
+      return converted;
+    }
+  } catch (err) {
+    logger.warn(`LibreOffice 转换失败 ${filePath}: ${String(err)}`);
+  }
+  return filePath;
+}
+
 /** 收到的媒体文件落盘：state/media/inbound/ */
 async function saveMediaFile(
   buffer: Buffer,
@@ -226,7 +263,12 @@ async function handleMessage(
       });
       if (saved.decryptedPicPath) { mediaPath = saved.decryptedPicPath; mediaKind = "image"; }
       else if (saved.decryptedVideoPath) { mediaPath = saved.decryptedVideoPath; mediaKind = "video"; }
-      else if (saved.decryptedFilePath) { mediaPath = saved.decryptedFilePath; mediaKind = "file"; }
+      else if (saved.decryptedFilePath) {
+        mediaPath = saved.decryptedFilePath;
+        mediaKind = "file";
+        // 旧版 Office 格式自动转新版（.doc→.docx 等），否则模型读不了
+        mediaPath = convertLegacyOfficeFile(mediaPath);
+      }
       else if (saved.decryptedVoicePath) { mediaPath = saved.decryptedVoicePath; mediaKind = "voice"; }
     } catch (err) {
       logger.error(`媒体下载/解密失败 from=${from}: ${String(err)}`);
