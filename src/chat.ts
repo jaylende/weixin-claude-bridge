@@ -23,6 +23,7 @@ const SYSTEM_PROMPT = [
   "- 回答简洁直接、适合手机阅读，避免大段表格和复杂 Markdown 格式",
   "- 语气自然友好",
   "- 处理用户发来的文件时：优先用现成库（PDF 用 pymupdf/pdfplumber，Word 用 python-docx，Excel 用 openpyxl）。如果文件无法读取、解析失败或格式不支持，直接告知用户「无法识别这个文件」并说明原因，不要反复尝试不同的方法，也不要生成无关文件。",
+  "- 按模板填写/修改 Word 文档时：必须复制模板文件后在其上修改（shutil.copy 模板 → python-docx 打开副本 → 改内容 → 另存），严禁从零新建 docx——模板的封面、表格、字体样式必须原样保留。旧版 .doc 模板先用 LibreOffice（soffice --headless --convert-to docx）转换。",
 ].join("\n");
 
 /**
@@ -74,7 +75,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "run_python",
     description:
-      "在电脑上执行 Python 代码生成或处理文件（Word docx / Excel xlsx / PDF / 图片等）。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。",
+      "在电脑上执行 Python 代码生成或处理文件。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。",
     input_schema: {
       type: "object",
       properties: {

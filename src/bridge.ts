@@ -225,9 +225,17 @@ async function saveMediaFile(
 
 const MAX_IMAGE_BYTES_FOR_MODEL = 5 * 1024 * 1024; // 模型视觉单图上限
 
-/** 最近收到的文件（每用户），供后续纯文本消息中的「这个文件」指代。 */
-const recentInboundFiles = new Map<string, { path: string; at: number }>();
-const RECENT_FILE_WINDOW_MS = 10 * 60_000; // 10 分钟内有效
+/** 最近收到的文件（每用户，最多保留 5 个），供后续文字消息中的「这个文件/模板」指代。 */
+const recentInboundFiles = new Map<string, { path: string; at: number }[]>();
+const RECENT_FILE_WINDOW_MS = 30 * 60_000; // 30 分钟内有效
+const MAX_RECENT_FILES = 5;
+
+function rememberInboundFile(userId: string, filePath: string): void {
+  const list = recentInboundFiles.get(userId) ?? [];
+  list.push({ path: filePath, at: Date.now() });
+  while (list.length > MAX_RECENT_FILES) list.shift();
+  recentInboundFiles.set(userId, list);
+}
 
 /**
  * 待合并的媒体消息：微信把「文件+要求」拆成两条消息（文件在前），
@@ -283,7 +291,7 @@ async function handleMessage(
 
   // 记录最近收到的文件，供后续文字消息指代
   if (mediaPath && mediaKind !== "image") {
-    recentInboundFiles.set(from, { path: mediaPath, at: Date.now() });
+    rememberInboundFile(from, mediaPath);
   }
 
   // 纯媒体消息：挂起 3.5 秒等文字要求，合并成一次处理（微信把「文件+要求」拆成两条消息）
@@ -329,10 +337,16 @@ async function handleMessage(
     const note = `[用户刚发了一个${kindLabel}，保存在 ${mediaPath}。用户的要求若提到「这个文件」「它」，指的就是这个文件。如果无法读取或解析该文件，直接告知用户无法识别，不要反复尝试，也不要自己生成无关文件。]`;
     prompt = prompt ? `${prompt}\n${note}` : note;
   } else if (text && !mediaPath) {
-    // 纯文本消息：若用户 10 分钟内发过文件，把文件路径附上供指代
-    const recent = recentInboundFiles.get(from);
-    if (recent && Date.now() - recent.at < RECENT_FILE_WINDOW_MS) {
-      prompt = `${text}\n[用户最近发来的文件保存在 ${recent.path}。用户若提到「这个文件」「它」，指的就是这个文件。如果无法读取或解析，直接告知无法识别，不要反复尝试。]`;
+    // 纯文本消息：把用户最近发来的文件（含文件名）全部附上供指代
+    const recent = (recentInboundFiles.get(from) ?? []).filter(
+      (f) => Date.now() - f.at < RECENT_FILE_WINDOW_MS,
+    );
+    if (recent.length > 0) {
+      const fileList = recent.map((f) => `- ${path.basename(f.path)}（${f.path}）`).join("\n");
+      prompt =
+        `${text}\n[用户最近发来的文件：\n${fileList}\n` +
+        `用户提到「这个文件」「模板」「文件1/文件2」等时，按文件名对上号。` +
+        `如果无法读取或解析某个文件，直接告知无法识别，不要反复尝试。]`;
     }
   }
   if (!prompt && images) prompt = ""; // askClaude 内会给纯图片消息补默认提问
