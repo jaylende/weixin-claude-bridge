@@ -188,8 +188,8 @@ async function executeReadPdfPages(
       }
     }
   }
-  const maxLen = 40_000;
-  const truncated = fullText.length > maxLen ? `${fullText.slice(0, maxLen)}\n…(内容过长已截断)` : fullText;
+  const maxLen = 20_000;
+  const truncated = fullText.length > maxLen ? `${fullText.slice(0, maxLen)}\n…(内容过长已截断，如需要可换其他方式读取)` : fullText;
   return `共 ${data.pages.length} 页（${imagePages} 页经视觉识别）。内容如下：\n${truncated}`;
 }
 
@@ -331,7 +331,7 @@ export async function askClaude(
   const historyText = text.trim() || (images?.length ? "[图片消息]" : "");
   history.push({ role: "user", content: historyText });
 
-  const MAX_TOOL_ROUNDS = 6;
+  const MAX_TOOL_ROUNDS = 12;
 
   const run = async (withImages: boolean, overrideText?: string): Promise<AskResult> => {
     const generated = collectGeneratedFiles();
@@ -401,8 +401,14 @@ export async function askClaude(
       .join("")
       .trim();
     if (!reply && final.stop_reason === "tool_use") {
-      // 工具轮数耗尽仍在要工具：给明确兜底，不再继续
-      return { reply: "抱歉，这个文件我无法识别（格式可能不支持或已加密）。", files: [...generated] };
+      // 工具轮数耗尽仍在要工具：任务未完成，给出可续做提示
+      if (generated.size > 0) {
+        return { reply: "", files: [...generated] }; // 发已完成产物，不报错
+      }
+      return {
+        reply: "任务比较复杂，我处理到一半达到轮数上限了。请回复「继续」，我会接着做。",
+        files: [...generated],
+      };
     }
     if (!reply && generated.size > 0) {
       // 工具全部执行完但模型没给总结文本（如被 max_tokens 截断）
