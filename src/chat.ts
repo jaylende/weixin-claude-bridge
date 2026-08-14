@@ -1,5 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
 import { logger } from "./vendor/logger.js";
 import { loadChatFile, saveChatFile } from "./state.js";
@@ -44,6 +47,104 @@ const client = createClient();
 /** 内存缓存：userId -> 对话历史 */
 const historyCache = new Map<string, ChatMessage[]>();
 
+// ---------------------------------------------------------------------------
+// 文件生成工具（模型在电脑上干活：写文件 / 跑 Python 生成任意格式）
+// ---------------------------------------------------------------------------
+
+/** 工具产物的输出目录，生成的文件会发回微信。 */
+const OUTPUTS_DIR = path.join(process.env.BRIDGE_STATE_DIR || "state", "outputs");
+
+const TOOLS: Anthropic.Tool[] = [
+  {
+    name: "write_file",
+    description:
+      "在电脑上写一个文本类文件（txt/md/csv/json/html 等），内容必须一次给全。文件会发送给微信用户。",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "文件名（不含目录，如 report.md）" },
+        content: { type: "string", description: "文件的完整内容" },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "run_python",
+    description:
+      "在电脑上执行 Python 代码生成任意格式文件（Word docx / Excel xlsx / PDF / 图片等）。可用库：python-docx、openpyxl、reportlab、PIL。用 os.getcwd() 作为文件保存目录（即输出目录）。",
+    input_schema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "完整的 Python 代码，产物保存到当前工作目录" },
+      },
+      required: ["code"],
+    },
+  },
+];
+
+/** 本轮调用中新生成的文件（执行工具时收集，最终发回微信）。 */
+function collectGeneratedFiles(): Set<string> {
+  return new Set<string>();
+}
+
+/** 沙箱校验：目标路径必须位于 OUTPUTS_DIR 内。 */
+function resolveInsideOutputs(fileName: string): string {
+  const target = path.resolve(OUTPUTS_DIR, path.basename(fileName));
+  if (!target.startsWith(path.resolve(OUTPUTS_DIR))) {
+    throw new Error("非法路径：" + fileName);
+  }
+  return target;
+}
+
+async function executeWriteFile(
+  input: { path?: string; content?: string },
+  generated: Set<string>,
+): Promise<string> {
+  const fileName = input.path?.trim();
+  const content = input.content ?? "";
+  if (!fileName) return "错误：缺少 path";
+  const target = resolveInsideOutputs(fileName);
+  fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
+  fs.writeFileSync(target, content, "utf-8");
+  generated.add(target);
+  return `已写入 ${path.basename(target)}（${content.length} 字符）`;
+}
+
+async function executeRunPython(
+  input: { code?: string },
+  generated: Set<string>,
+): Promise<string> {
+  const code = input.code ?? "";
+  if (!code.trim()) return "错误：缺少 code";
+  fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
+  const before = new Set(fs.readdirSync(OUTPUTS_DIR));
+  const scriptName = `_run_${Date.now()}.py`;
+  const scriptPath = path.join(OUTPUTS_DIR, scriptName);
+  fs.writeFileSync(scriptPath, code, "utf-8");
+  try {
+    const stdout = execFileSync("python", [scriptPath], {
+      cwd: OUTPUTS_DIR,
+      timeout: 60_000,
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      windowsHide: true,
+    });
+    for (const f of fs.readdirSync(OUTPUTS_DIR)) {
+      if (!before.has(f) && f !== scriptName) generated.add(path.join(OUTPUTS_DIR, f));
+    }
+    return stdout.trim() || "(执行成功，无控制台输出)";
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message?: string };
+    return `执行失败: ${e.message ?? String(err)}\nstderr: ${e.stderr ?? ""}`.slice(0, 2000);
+  } finally {
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch {
+      // best-effort
+    }
+  }
+}
+
 export function getHistory(userId: string): ChatMessage[] {
   const cached = historyCache.get(userId);
   if (cached) return cached;
@@ -71,8 +172,28 @@ const VISION_API_KEY = process.env.VISION_API_KEY;
 const VISION_BASE_URL = process.env.VISION_BASE_URL || "https://open.bigmodel.cn/api/paas/v4";
 const VISION_MODEL = process.env.VISION_MODEL || "glm-4v-flash";
 
+/**
+ * 压缩图片以适配免费视觉模型的限制：
+ * 最长边 1280px + JPEG 80%（微信原图动辄几 MB，免费档会拒绝）。
+ * 压缩后没变小则返回原图。
+ */
+async function compressImage(img: ImageInput): Promise<ImageInput> {
+  const { default: sharp } = await import("sharp");
+  const buf = Buffer.from(img.data, "base64");
+  const compressed = await sharp(buf)
+    .rotate() // 处理 EXIF 方向
+    .resize({ width: 1280, height: 1280, fit: "inside", withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  if (compressed.length < buf.length) {
+    return { data: compressed.toString("base64"), mediaType: "image/jpeg" };
+  }
+  return img;
+}
+
 /** 调用 OpenAI 兼容格式的视觉模型，把图片转成文字描述。 */
 async function describeImages(images: ImageInput[]): Promise<string> {
+  const prepared = await Promise.all(images.map(compressImage));
   const res = await fetch(`${VISION_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
@@ -85,7 +206,7 @@ async function describeImages(images: ImageInput[]): Promise<string> {
         {
           role: "user",
           content: [
-            ...images.map((img) => ({
+            ...prepared.map((img) => ({
               type: "image_url",
               image_url: { url: `data:${img.mediaType};base64,${img.data}` },
             })),
@@ -100,7 +221,8 @@ async function describeImages(images: ImageInput[]): Promise<string> {
     }),
   });
   if (!res.ok) {
-    throw new Error(`视觉模型调用失败: HTTP ${res.status}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(`视觉模型调用失败: HTTP ${res.status} ${body.slice(0, 200)}`);
   }
   const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
   const desc = data.choices?.[0]?.message?.content?.trim();
@@ -108,8 +230,10 @@ async function describeImages(images: ImageInput[]): Promise<string> {
   return desc;
 }
 
+export type AskResult = { reply: string; files: string[] };
+
 /**
- * 向 Claude 提问并流式获取完整回复。
+ * 向 Claude 提问并流式获取完整回复，支持工具调用（写文件/跑 Python 生成文件）。
  * 带图片时的降级链：原生视觉（模型支持）→ 外部视觉模型转描述（配了 VISION_API_KEY）
  * → 纯文本提示（都不行）。
  * 调用失败时回滚本次用户消息，抛出异常由调用方兜底。
@@ -118,13 +242,16 @@ export async function askClaude(
   userId: string,
   text: string,
   images?: ImageInput[],
-): Promise<string> {
+): Promise<AskResult> {
   const history = getHistory(userId);
-  // 历史里只存文本（图片不落历史，避免文件膨胀）
+  // 历史里只存文本（图片/工具产物不落历史，避免文件膨胀）
   const historyText = text.trim() || (images?.length ? "[图片消息]" : "");
   history.push({ role: "user", content: historyText });
 
-  const run = async (withImages: boolean, overrideText?: string): Promise<string> => {
+  const MAX_TOOL_ROUNDS = 6;
+
+  const run = async (withImages: boolean, overrideText?: string): Promise<AskResult> => {
+    const generated = collectGeneratedFiles();
     const userContent = withImages && images?.length
       ? [
           ...images.map((img) => ({
@@ -139,30 +266,77 @@ export async function askClaude(
         ]
       : (overrideText ?? historyText);
 
-    const stream = client.messages.stream({
-      model: MODEL,
-      max_tokens: 16000,
-      system: SYSTEM_PROMPT,
-      messages: [
-        ...history.slice(0, -1),
-        { role: "user" as const, content: userContent },
-      ],
-    });
+    const apiMessages: Anthropic.MessageParam[] = [
+      ...history.slice(0, -1),
+      { role: "user", content: userContent },
+    ];
 
-    const final = await stream.finalMessage();
+    let final = await streamOnce(apiMessages);
+    let rounds = 0;
+
+    // 工具循环：模型要调工具就执行并把结果回传，直到给出最终文本
+    while (final.stop_reason === "tool_use" && rounds < MAX_TOOL_ROUNDS) {
+      rounds += 1;
+      apiMessages.push({
+        role: "assistant",
+        content: final.content as Anthropic.MessageParam["content"],
+      });
+
+      const results: Anthropic.ToolResultBlockParam[] = [];
+      for (const block of final.content) {
+        if (block.type !== "tool_use") continue;
+        let resultText: string;
+        try {
+          if (block.name === "write_file") {
+            resultText = await executeWriteFile(block.input as { path?: string; content?: string }, generated);
+          } else if (block.name === "run_python") {
+            resultText = await executeRunPython(block.input as { code?: string }, generated);
+          } else {
+            resultText = `未知工具: ${block.name}`;
+          }
+          logger.info(`工具 ${block.name} 执行完成: ${resultText.slice(0, 100)}`);
+        } catch (err) {
+          resultText = `工具执行出错: ${String(err)}`;
+          logger.error(`工具 ${block.name} 执行失败: ${String(err)}`);
+        }
+        results.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: resultText,
+        });
+      }
+      apiMessages.push({ role: "user", content: results });
+      final = await streamOnce(apiMessages);
+    }
+
     const reply = final.content
       .filter((b): b is Anthropic.TextBlock => b.type === "text")
       .map((b) => b.text)
       .join("")
       .trim();
+    if (!reply && generated.size > 0) {
+      // 工具全部执行完但模型没给总结文本（如被 max_tokens 截断）
+      return { reply: "", files: [...generated] };
+    }
     if (!reply) throw new Error("模型返回了空回复");
-    return reply;
+    return { reply, files: [...generated] };
+  };
+
+  const streamOnce = (messages: Anthropic.MessageParam[]) => {
+    const stream = client.messages.stream({
+      model: MODEL,
+      max_tokens: 16000,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages,
+    });
+    return stream.finalMessage();
   };
 
   try {
-    let reply: string;
+    let result: AskResult;
     if (images?.length) {
-      reply = await run(true).catch(async (err) => {
+      result = await run(true).catch(async (err) => {
         // 模型不支持视觉（400）
         if (err instanceof Anthropic.BadRequestError) {
           if (VISION_API_KEY) {
@@ -179,12 +353,13 @@ export async function askClaude(
         throw err;
       });
     } else {
-      reply = await run(false);
+      result = await run(false);
     }
 
-    history.push({ role: "assistant", content: reply });
+    // 历史只落最终文本（工具中间过程不持久化）
+    history.push({ role: "assistant", content: result.reply || "已生成文件。" });
     persist(userId, history);
-    return reply;
+    return result;
   } catch (err) {
     history.pop(); // 回滚，失败不污染历史
     throw err;

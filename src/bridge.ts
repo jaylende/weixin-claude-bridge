@@ -24,6 +24,7 @@ import {
 import { askClaude } from "./chat.js";
 import type { ImageInput } from "./chat.js";
 import { downloadMediaFromItem } from "./vendor/media/media-download.js";
+import { sendWeixinMediaFile } from "./vendor/messaging/send-media.js";
 import { getMimeFromFilename } from "./vendor/media/mime.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -228,8 +229,11 @@ async function handleMessage(
   await sendTypingTo(opts, from, contextToken, TypingStatus.TYPING);
 
   let reply: string;
+  let files: string[] = [];
   try {
-    reply = await askClaude(from, prompt, images);
+    const result = await askClaude(from, prompt, images);
+    reply = result.reply;
+    files = result.files;
   } catch (err) {
     logger.error(`模型调用失败 from=${from}: ${String(err)}`);
     reply = "抱歉，出错了，请稍后再试。";
@@ -241,6 +245,27 @@ async function handleMessage(
       token: opts.token,
       body: buildTextSendBody(from, chunk, contextToken),
     });
+  }
+
+  // 生成的文件逐个发回微信
+  for (const filePath of files) {
+    try {
+      await sendWeixinMediaFile({
+        filePath,
+        to: from,
+        text: `📄 ${path.basename(filePath)}`,
+        opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken },
+        cdnBaseUrl: CDN_BASE_URL,
+      });
+      logger.info(`文件已发回微信 from=${from} file=${filePath}`);
+    } catch (err) {
+      logger.error(`文件发送失败 from=${from} file=${filePath}: ${String(err)}`);
+      await sendMessageApi({
+        baseUrl: opts.baseUrl,
+        token: opts.token,
+        body: buildTextSendBody(from, `文件 ${path.basename(filePath)} 发送失败：${String(err)}`, contextToken),
+      }).catch(() => {});
+    }
   }
 
   await sendTypingTo(opts, from, contextToken, TypingStatus.CANCEL);
@@ -333,6 +358,7 @@ export async function startBridge(): Promise<void> {
 
   const shutdown = (): void => {
     logger.info("收到退出信号，通知微信服务端停止...");
+    clearInterval(refreshTimer);
     releaseInstanceLock();
     void notifyStop(opts).catch(() => {});
     process.exit(0);
@@ -342,6 +368,15 @@ export async function startBridge(): Promise<void> {
 
   logger.info(`bridge 已启动：botId=${bot.botId} baseUrl=${baseUrl}`);
   console.log("✅ 桥已启动，等待微信消息...（Ctrl+C 退出）");
+
+  // iLink 连接有效期约 24 小时，定时刷新（参考 weixin-ClawBot-API 的重连机制）
+  const REFRESH_INTERVAL_MS = 22 * 3_600_000;
+  const refreshTimer = setInterval(() => {
+    void notifyStart(opts)
+      .then((r) => logger.info(`定时刷新连接 ret=${r.ret ?? "(无)"}`))
+      .catch((e) => logger.warn(`定时刷新连接失败: ${String(e)}`));
+  }, REFRESH_INTERVAL_MS);
+  refreshTimer.unref?.();
 
   let getUpdatesBuf = loadSyncBuf();
   let consecutiveFailures = 0;
