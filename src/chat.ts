@@ -200,7 +200,15 @@ async function executeRunPython(
   const code = input.code ?? "";
   if (!code.trim()) return "错误：缺少 code";
   fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
-  const before = new Set(fs.readdirSync(OUTPUTS_DIR));
+  // 记录执行前各文件的修改时间：新文件或内容被覆盖/改写的文件都算产物
+  const before = new Map<string, number>();
+  for (const f of fs.readdirSync(OUTPUTS_DIR)) {
+    try {
+      before.set(f, fs.statSync(path.join(OUTPUTS_DIR, f)).mtimeMs);
+    } catch {
+      // 忽略
+    }
+  }
   const scriptName = `_run_${Date.now()}.py`;
   const scriptPath = path.join(OUTPUTS_DIR, scriptName);
   fs.writeFileSync(scriptPath, code, "utf-8");
@@ -213,7 +221,15 @@ async function executeRunPython(
       windowsHide: true,
     });
     for (const f of fs.readdirSync(OUTPUTS_DIR)) {
-      if (!before.has(f) && f !== scriptName) generated.add(path.join(OUTPUTS_DIR, f));
+      if (f === scriptName) continue;
+      const full = path.join(OUTPUTS_DIR, f);
+      try {
+        const mtime = fs.statSync(full).mtimeMs;
+        const prev = before.get(f);
+        if (prev === undefined || mtime > prev + 1) generated.add(full);
+      } catch {
+        // 忽略
+      }
     }
     return stdout.trim() || "(执行成功，无控制台输出)";
   } catch (err) {
