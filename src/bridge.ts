@@ -317,8 +317,12 @@ async function handleMessage(
     });
   }
 
-  // 生成的文件逐个发回微信
+  // 生成的文件逐个发回微信（已不存在的跳过——模型可能中途重命名/删除）
   for (const filePath of files) {
+    if (!fs.existsSync(filePath)) {
+      logger.warn(`跳过不存在的产物 from=${from} file=${filePath}`);
+      continue;
+    }
     try {
       await sendWeixinMediaFile({
         filePath,
