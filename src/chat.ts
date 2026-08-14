@@ -71,7 +71,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "run_python",
     description:
-      "在电脑上执行 Python 代码生成任意格式文件（Word docx / Excel xlsx / PDF / 图片等）。可用库：python-docx、openpyxl、reportlab、PIL。用 os.getcwd() 作为文件保存目录（即输出目录）。",
+      "在电脑上执行 Python 代码生成或处理文件（Word docx / Excel xlsx / PDF / 图片等）。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF，加密 PDF 可用 pymupdf.open(path) 打开）、pdfplumber、pypdf、pycryptodome。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。",
     input_schema: {
       type: "object",
       properties: {
