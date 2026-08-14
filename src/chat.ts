@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -72,13 +73,25 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "run_python",
     description:
-      "在电脑上执行 Python 代码生成或处理文件（Word docx / Excel xlsx / PDF / 图片等）。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF，加密 PDF 可用 pymupdf.open(path) 打开）、pdfplumber、pypdf、pycryptodome。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。",
+      "在电脑上执行 Python 代码生成或处理文件（Word docx / Excel xlsx / PDF / 图片等）。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。",
     input_schema: {
       type: "object",
       properties: {
         code: { type: "string", description: "完整的 Python 代码，产物保存到当前工作目录" },
       },
       required: ["code"],
+    },
+  },
+  {
+    name: "read_pdf_pages",
+    description:
+      "读取 PDF 文件的全部文字内容（含扫描件/图片型 PDF——无文字层的页面会经视觉模型识别）。读 PDF 内容必须优先用这个工具，不要自己写代码解析。",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "PDF 文件的绝对路径" },
+      },
+      required: ["path"],
     },
   },
 ];
@@ -109,6 +122,74 @@ async function executeWriteFile(
   fs.writeFileSync(target, content, "utf-8");
   generated.add(target);
   return `已写入 ${path.basename(target)}（${content.length} 字符）`;
+}
+
+/** PDF 提取脚本（pymupdf 抽文字层 + 无文字页渲染 PNG）。 */
+const EXTRACT_PDF_SCRIPT = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../scripts/extract_pdf.py",
+);
+
+/**
+ * 读取 PDF 全文：文字层直接提取；图片型页面渲染后经视觉模型（GLM）识别。
+ * 覆盖扫描件/加密 PDF 场景，模型无需自己解析。
+ */
+async function executeReadPdfPages(
+  input: { path?: string },
+): Promise<string> {
+  const pdfPath = input.path?.trim();
+  if (!pdfPath) return "错误：缺少 path";
+  if (!pdfPath.toLowerCase().endsWith(".pdf")) return "错误：只支持 .pdf 文件";
+  if (!fs.existsSync(pdfPath)) return `错误：文件不存在 ${pdfPath}`;
+
+  fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
+  const raw = execFileSync("python", [EXTRACT_PDF_SCRIPT, pdfPath], {
+    cwd: OUTPUTS_DIR,
+    timeout: 120_000,
+    encoding: "utf-8",
+    maxBuffer: 20 * 1024 * 1024,
+    windowsHide: true,
+  });
+  const data = JSON.parse(raw) as {
+    pages: { index: number; has_text: boolean; text: string }[];
+    images: { index: number; png: string }[];
+  };
+
+  let fullText = "";
+  for (const page of data.pages) {
+    if (page.has_text) {
+      fullText += `\n--- 第${page.index + 1}页 ---\n${page.text}\n`;
+    }
+  }
+  let imagePages = 0;
+  if (data.images.length > 0) {
+    if (!VISION_API_KEY) {
+      fullText += `\n（共 ${data.images.length} 页无文字层，且未配置视觉模型，无法识别）\n`;
+    } else {
+      for (const img of data.images) {
+        try {
+          const pngPath = path.join(OUTPUTS_DIR, img.png);
+          const buf = fs.readFileSync(pngPath);
+          const desc = await describeImages([
+            { data: buf.toString("base64"), mediaType: "image/png" },
+          ]);
+          fullText += `\n--- 第${img.index + 1}页（视觉识别）---\n${desc}\n`;
+          imagePages += 1;
+        } catch (err) {
+          fullText += `\n--- 第${img.index + 1}页（视觉识别失败: ${String(err).slice(0, 100)}）---\n`;
+        } finally {
+          try {
+            fs.unlinkSync(path.join(OUTPUTS_DIR, img.png));
+          } catch {
+            // best-effort
+          }
+        }
+      }
+    }
+  }
+  const maxLen = 40_000;
+  const truncated = fullText.length > maxLen ? `${fullText.slice(0, maxLen)}\n…(内容过长已截断)` : fullText;
+  return `共 ${data.pages.length} 页（${imagePages} 页经视觉识别）。内容如下：\n${truncated}`;
 }
 
 async function executeRunPython(
@@ -292,6 +373,8 @@ export async function askClaude(
             resultText = await executeWriteFile(block.input as { path?: string; content?: string }, generated);
           } else if (block.name === "run_python") {
             resultText = await executeRunPython(block.input as { code?: string }, generated);
+          } else if (block.name === "read_pdf_pages") {
+            resultText = await executeReadPdfPages(block.input as { path?: string });
           } else {
             resultText = `未知工具: ${block.name}`;
           }

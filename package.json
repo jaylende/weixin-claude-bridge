@@ -17,6 +17,7 @@
     "@anthropic-ai/sdk": "^0.110.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "0.12.0",
+    "sharp": "^0.35.3",
     "undici": "^7.0.0"
   },
   "devDependencies": {
