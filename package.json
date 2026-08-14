@@ -1,0 +1,27 @@
+{
+  "name": "weixin-claude-bridge",
+  "version": "1.0.0",
+  "description": "基于微信 iLink Bot 协议把 Claude 直接接入微信",
+  "type": "module",
+  "ilink_appid": "bot",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "login": "tsx src/index.ts login",
+    "status": "tsx src/index.ts status",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "qrcode-terminal": "0.12.0",
+    "undici": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
