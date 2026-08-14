@@ -59,8 +59,9 @@ function buildTextSendBody(to: string, text: string, contextToken?: string): Sen
   };
 }
 
-/** 按长度分块，优先在换行处断开。 */
+/** 按长度分块，优先在换行处断开。空文本返回空数组（不发消息）。 */
 function splitText(text: string, maxLen = MAX_CHUNK_LEN): string[] {
+  if (!text) return [];
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
   let rest = text;
@@ -164,6 +165,10 @@ async function saveMediaFile(
 
 const MAX_IMAGE_BYTES_FOR_MODEL = 5 * 1024 * 1024; // 模型视觉单图上限
 
+/** 最近收到的文件（每用户），供后续纯文本消息中的「这个文件」指代。 */
+const recentInboundFiles = new Map<string, { path: string; at: number }>();
+const RECENT_FILE_WINDOW_MS = 10 * 60_000; // 10 分钟内有效
+
 async function handleMessage(
   msg: WeixinMessage,
   opts: { baseUrl: string; token: string },
@@ -198,6 +203,11 @@ async function handleMessage(
 
   if (!text && !mediaPath) return;
 
+  // 记录最近收到的文件，供后续文字消息指代
+  if (mediaPath && mediaKind !== "image") {
+    recentInboundFiles.set(from, { path: mediaPath, at: Date.now() });
+  }
+
   // 构造给模型的输入：图片走视觉；其他媒体只告知保存路径
   let prompt = text;
   let images: ImageInput[] | undefined;
@@ -216,8 +226,14 @@ async function handleMessage(
     const kindLabel = (
       { image: "图片", video: "视频", file: "文件", voice: "语音" } as const
     )[mediaKind!];
-    const note = `[用户发了一个${kindLabel}，已保存到 ${mediaPath}]`;
+    const note = `[用户刚发了一个${kindLabel}，保存在 ${mediaPath}。用户的要求若提到「这个文件」「它」，指的就是这个文件。如果无法读取或解析该文件，直接告知用户无法识别，不要反复尝试，也不要自己生成无关文件。]`;
     prompt = prompt ? `${prompt}\n${note}` : note;
+  } else if (text && !mediaPath) {
+    // 纯文本消息：若用户 10 分钟内发过文件，把文件路径附上供指代
+    const recent = recentInboundFiles.get(from);
+    if (recent && Date.now() - recent.at < RECENT_FILE_WINDOW_MS) {
+      prompt = `${text}\n[用户最近发来的文件保存在 ${recent.path}。用户若提到「这个文件」「它」，指的就是这个文件。如果无法读取或解析，直接告知无法识别，不要反复尝试。]`;
+    }
   }
   if (!prompt && images) prompt = ""; // askClaude 内会给纯图片消息补默认提问
 

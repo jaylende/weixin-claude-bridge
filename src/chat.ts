@@ -20,6 +20,7 @@ const SYSTEM_PROMPT = [
   "- 始终使用简体中文回复",
   "- 回答简洁直接、适合手机阅读，避免大段表格和复杂 Markdown 格式",
   "- 语气自然友好",
+  "- 处理用户发来的文件时：优先用现成库（PDF 用 pymupdf/pdfplumber，Word 用 python-docx，Excel 用 openpyxl）。如果文件无法读取、解析失败或格式不支持，直接告知用户「无法识别这个文件」并说明原因，不要反复尝试不同的方法，也不要生成无关文件。",
 ].join("\n");
 
 /**
@@ -314,6 +315,10 @@ export async function askClaude(
       .map((b) => b.text)
       .join("")
       .trim();
+    if (!reply && final.stop_reason === "tool_use") {
+      // 工具轮数耗尽仍在要工具：给明确兜底，不再继续
+      return { reply: "抱歉，这个文件我无法识别（格式可能不支持或已加密）。", files: [...generated] };
+    }
     if (!reply && generated.size > 0) {
       // 工具全部执行完但模型没给总结文本（如被 max_tokens 截断）
       return { reply: "", files: [...generated] };
