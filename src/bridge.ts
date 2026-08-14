@@ -253,7 +253,7 @@ async function handleMessage(
       await sendWeixinMediaFile({
         filePath,
         to: from,
-        text: `📄 ${path.basename(filePath)}`,
+        text: "", // 不带文字说明，微信文件消息本身会显示文件名
         opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken },
         cdnBaseUrl: CDN_BASE_URL,
       });
