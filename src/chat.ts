@@ -26,6 +26,7 @@ const SYSTEM_PROMPT = [
   "- 处理用户发来的文件时：优先用现成库（PDF 用 pymupdf/pdfplumber，Word 用 python-docx，Excel 用 openpyxl）。如果文件无法读取、解析失败或格式不支持，直接告知用户「无法识别这个文件」并说明原因，不要反复尝试不同的方法，也不要生成无关文件。",
   "- 按模板填写/修改 Word 文档时：必须复制模板文件后在其上修改（shutil.copy 模板 → python-docx 打开副本 → 改内容 → 另存），严禁从零新建 docx——模板的封面、表格、字体样式必须原样保留。旧版 .doc 模板先用 LibreOffice（soffice --headless --convert-to docx）转换。",
   "- 涉及时事新闻、最新数据、实时信息、你不确定的事实时，必须先用 web_search 搜索，必要时用 web_fetch 读取具体页面，再综合回答。禁止凭训练记忆编造近期信息。",
+  "- 用户要求操作电脑（打开应用、点击、输入等）时：用 run_python + pyautogui 执行。每步操作后截图确认，小步慢走；目标元素找不到就截图分析再试；涉及金钱、删除文件、卸载软件等危险操作必须先向用户确认。",
 ].join("\n");
 
 /**
@@ -77,7 +78,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "run_python",
     description:
-      "在电脑上执行 Python 代码生成或处理文件。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。",
+      "在电脑上执行 Python 代码生成/处理文件或控制电脑。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome、pyautogui（模拟鼠标键盘控制电脑：定位屏幕元素、点击、输入文字、截图）。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。\n\n【电脑控制规范】用 pyautogui 时：每步操作后用 pyautogui.screenshot() 截图（保存到当前目录）确认屏幕状态再继续；用 locateOnScreen/locateCenterOnScreen 定位按钮；操作前先确认目标窗口存在（pyautogui.getWindowsWithTitle）；每次动作要小步、可验证，不确定当前屏幕状态时先截图看再操作，禁止盲目连续点击。",
     input_schema: {
       type: "object",
       properties: {
@@ -96,6 +97,15 @@ const TOOLS: Anthropic.Tool[] = [
         path: { type: "string", description: "PDF 文件的绝对路径" },
       },
       required: ["path"],
+    },
+  },
+  {
+    name: "see_screen",
+    description:
+      "截取电脑当前屏幕并经视觉模型识别，返回屏幕内容的文字描述（有哪些窗口、按钮位置、界面状态）。操作电脑前后用它确认屏幕状态，不要盲操作。",
+    input_schema: {
+      type: "object",
+      properties: {},
     },
   },
   {
@@ -150,6 +160,32 @@ async function executeWriteFile(
   fs.writeFileSync(target, content, "utf-8");
   generated.add(target);
   return `已写入 ${path.basename(target)}（${content.length} 字符）`;
+}
+
+/** 截屏并经视觉模型（GLM）转文字描述，让模型"看到"电脑屏幕。 */
+async function executeSeeScreen(): Promise<string> {
+  if (!VISION_API_KEY) return "错误：未配置视觉模型（VISION_API_KEY），无法识别屏幕内容";
+  fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
+  const pngName = `_screen_${Date.now()}.png`;
+  const pngPath = path.join(OUTPUTS_DIR, pngName);
+  try {
+    execFileSync(
+      "python",
+      ["-c", `import pyautogui; pyautogui.screenshot().save(r'${pngPath.replace(/\\/g, "\\\\")}')`],
+      { timeout: 30_000, windowsHide: true },
+    );
+    const buf = fs.readFileSync(pngPath);
+    const desc = await describeImages([{ data: buf.toString("base64"), mediaType: "image/png" }]);
+    return `屏幕内容描述（分辨率 2560x1600）：\n${desc}\n（可用 pyautogui.locateOnScreen 或 pyautogui.getWindowsWithTitle 配合定位具体元素）`;
+  } catch (err) {
+    return `截屏/识别失败: ${String(err).slice(0, 200)}`;
+  } finally {
+    try {
+      fs.unlinkSync(pngPath);
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 /** PDF 提取脚本（pymupdf 抽文字层 + 无文字页渲染 PNG）。 */
@@ -242,7 +278,7 @@ async function executeRunPython(
   try {
     const stdout = execFileSync("python", [scriptPath], {
       cwd: OUTPUTS_DIR,
-      timeout: 60_000,
+      timeout: 180_000,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
       windowsHide: true,
@@ -418,6 +454,8 @@ export async function askClaude(
             resultText = await executeWriteFile(block.input as { path?: string; content?: string }, generated);
           } else if (block.name === "run_python") {
             resultText = await executeRunPython(block.input as { code?: string }, generated);
+          } else if (block.name === "see_screen") {
+            resultText = await executeSeeScreen();
           } else if (block.name === "read_pdf_pages") {
             resultText = await executeReadPdfPages(block.input as { path?: string });
           } else if (block.name === "web_search") {
