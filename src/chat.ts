@@ -9,6 +9,7 @@ import { logger } from "./vendor/logger.js";
 import { loadChatFile, saveChatFile } from "./state.js";
 import type { ChatMessage } from "./state.js";
 import { emitProgress } from "./progress.js";
+import { webSearch, webFetch } from "./search.js";
 
 /** 模型：ANTHROPIC_MODEL 可覆盖，默认跟随官方推荐。 */
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5";
@@ -24,6 +25,7 @@ const SYSTEM_PROMPT = [
   "- 语气自然友好",
   "- 处理用户发来的文件时：优先用现成库（PDF 用 pymupdf/pdfplumber，Word 用 python-docx，Excel 用 openpyxl）。如果文件无法读取、解析失败或格式不支持，直接告知用户「无法识别这个文件」并说明原因，不要反复尝试不同的方法，也不要生成无关文件。",
   "- 按模板填写/修改 Word 文档时：必须复制模板文件后在其上修改（shutil.copy 模板 → python-docx 打开副本 → 改内容 → 另存），严禁从零新建 docx——模板的封面、表格、字体样式必须原样保留。旧版 .doc 模板先用 LibreOffice（soffice --headless --convert-to docx）转换。",
+  "- 涉及时事新闻、最新数据、实时信息、你不确定的事实时，必须先用 web_search 搜索，必要时用 web_fetch 读取具体页面，再综合回答。禁止凭训练记忆编造近期信息。",
 ].join("\n");
 
 /**
@@ -94,6 +96,30 @@ const TOOLS: Anthropic.Tool[] = [
         path: { type: "string", description: "PDF 文件的绝对路径" },
       },
       required: ["path"],
+    },
+  },
+  {
+    name: "web_search",
+    description:
+      "搜索网络获取最新信息（时事新闻、实时数据、不确定的事实等）。涉及最新/实时信息时必须先搜索再回答，不要凭训练记忆编造。",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "搜索关键词（中文或英文）" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "web_fetch",
+    description:
+      "抓取指定网页的正文文本。用于阅读搜索结果中的具体页面内容。",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "完整网页 URL（https:// 开头）" },
+      },
+      required: ["url"],
     },
   },
 ];
@@ -394,6 +420,25 @@ export async function askClaude(
             resultText = await executeRunPython(block.input as { code?: string }, generated);
           } else if (block.name === "read_pdf_pages") {
             resultText = await executeReadPdfPages(block.input as { path?: string });
+          } else if (block.name === "web_search") {
+            const q = (block.input as { query?: string }).query?.trim() ?? "";
+            if (!q) {
+              resultText = "错误：缺少 query";
+            } else {
+              const results = await webSearch(q);
+              resultText = results.length
+                ? results
+                    .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`)
+                    .join("\n\n")
+                : "(无搜索结果，换个关键词试试)";
+            }
+          } else if (block.name === "web_fetch") {
+            const u = (block.input as { url?: string }).url?.trim() ?? "";
+            if (!u) {
+              resultText = "错误：缺少 url";
+            } else {
+              resultText = await webFetch(u);
+            }
           } else {
             resultText = `未知工具: ${block.name}`;
           }
