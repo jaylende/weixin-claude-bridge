@@ -78,7 +78,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "run_python",
     description:
-      "在电脑上执行 Python 代码生成/处理文件或控制电脑。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome、pyautogui（模拟鼠标键盘控制电脑：定位屏幕元素、点击、输入文字、截图）。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。\n\n【电脑控制规范】用 pyautogui 时：每步操作后用 pyautogui.screenshot() 截图（保存到当前目录）确认屏幕状态再继续；用 locateOnScreen/locateCenterOnScreen 定位按钮；操作前先确认目标窗口存在（pyautogui.getWindowsWithTitle）；每次动作要小步、可验证，不确定当前屏幕状态时先截图看再操作，禁止盲目连续点击。",
+      "在电脑上执行 Python 代码生成/处理文件或控制电脑。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome、pyautogui（模拟鼠标键盘控制电脑：定位屏幕元素、点击、输入文字）。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。\n\n【命名约定】下划线 _ 开头的文件是临时文件（截图、中间数据），不会发回微信；其他文件会被当作成果发回，不要写多余的中间文件。\n\n【电脑控制规范】用 pyautogui 时：确认屏幕状态请用 see_screen 工具（不要在本目录保存截图）；用 locateOnScreen/locateCenterOnScreen 定位按钮；操作前先确认目标窗口存在（pyautogui.getWindowsWithTitle）；每次动作要小步、可验证，禁止盲目连续点击。",
     input_schema: {
       type: "object",
       properties: {
@@ -158,8 +158,9 @@ async function executeWriteFile(
   const target = resolveInsideOutputs(fileName);
   fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
   fs.writeFileSync(target, content, "utf-8");
-  generated.add(target);
-  return `已写入 ${path.basename(target)}（${content.length} 字符）`;
+  const isTemp = path.basename(target).startsWith("_");
+  if (!isTemp) generated.add(target);
+  return `已写入 ${path.basename(target)}（${content.length} 字符${isTemp ? "，临时文件不会发回微信" : ""}）`;
 }
 
 /** 截屏并经视觉模型（GLM）转文字描述，让模型"看到"电脑屏幕。 */
@@ -285,6 +286,7 @@ async function executeRunPython(
     });
     for (const f of fs.readdirSync(OUTPUTS_DIR)) {
       if (f === scriptName) continue;
+      if (f.startsWith("_")) continue; // _ 前缀 = 临时文件（截图/中间产物），不发回微信
       const full = path.join(OUTPUTS_DIR, f);
       try {
         const mtime = fs.statSync(full).mtimeMs;
