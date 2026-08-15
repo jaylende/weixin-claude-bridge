@@ -110,6 +110,15 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: "request_user_help",
+    description:
+      "当你找不到目标元素、不确定点击哪里、或多次尝试失败时：截取当前屏幕并把截图发给用户，请用户在图上圈出要点击的位置。调用后结束回复并告诉用户：请在图上圈出目标位置后发回。用户发回圈选图后你会收到精确坐标。",
+    input_schema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
     name: "web_search",
     description:
       "搜索网络获取最新信息（时事新闻、实时数据、不确定的事实等）。涉及最新/实时信息时必须先搜索再回答，不要凭训练记忆编造。",
@@ -197,6 +206,24 @@ async function executeSeeScreen(): Promise<string> {
         // best-effort
       }
     }
+  }
+}
+
+/** 协作求助：截屏存到指定路径，桥随后把图发给用户圈选。 */
+export const HELP_SCREEN_PATH = path.join(process.env.BRIDGE_STATE_DIR || "state", "tmp", "help_screen.png");
+const HELP_SCREEN_DIR = path.dirname(HELP_SCREEN_PATH);
+
+async function executeRequestUserHelp(): Promise<string> {
+  fs.mkdirSync(HELP_SCREEN_DIR, { recursive: true });
+  try {
+    execFileSync(
+      "python",
+      ["-c", `import pyautogui; pyautogui.screenshot().save(r'${HELP_SCREEN_PATH.replace(/\\/g, "\\\\")}')`],
+      { timeout: 30_000, windowsHide: true },
+    );
+    return "屏幕截图已保存，将发送给用户圈选。现在结束回复，告诉用户：请在我发的截图上圈出要点击的位置，然后把图发回来。";
+  } catch (err) {
+    return `截图失败: ${String(err).slice(0, 150)}`;
   }
 }
 
@@ -469,6 +496,8 @@ export async function askClaude(
             resultText = await executeRunPython(block.input as { code?: string }, generated);
           } else if (block.name === "see_screen") {
             resultText = await executeSeeScreen();
+          } else if (block.name === "request_user_help") {
+            resultText = await executeRequestUserHelp();
           } else if (block.name === "read_pdf_pages") {
             resultText = await executeReadPdfPages(block.input as { path?: string });
           } else if (block.name === "web_search") {

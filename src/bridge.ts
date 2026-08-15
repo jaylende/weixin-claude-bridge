@@ -22,8 +22,9 @@ import {
   getContextToken,
   getAllContextUserIds,
 } from "./state.js";
-import { askClaude } from "./chat.js";
+import { askClaude, HELP_SCREEN_PATH } from "./chat.js";
 import type { ImageInput } from "./chat.js";
+import sharp from "sharp";
 import { startProgressServer, emitProgress } from "./progress.js";
 import { stopOmniParser } from "./screen.js";
 import { downloadMediaFromItem } from "./vendor/media/media-download.js";
@@ -227,6 +228,43 @@ async function saveMediaFile(
 }
 
 const MAX_IMAGE_BYTES_FOR_MODEL = 5 * 1024 * 1024; // 模型视觉单图上限
+const HELP_WINDOW_MS = 3 * 60_000; // 求助截图 3 分钟内有效
+
+/**
+ * 人圈猫点：对比「发出的求助截图」与「用户圈选后发回的图」，
+ * 找出差异区域（圈）的中心（坐标为求助截图上的像素）。
+ */
+async function findCircleCenter(
+  userImgPath: string,
+): Promise<{ x: number; y: number; w: number; h: number } | null> {
+  try {
+    const meta = await sharp(HELP_SCREEN_PATH).metadata();
+    const w = meta.width ?? 0;
+    const h = meta.height ?? 0;
+    if (!w || !h) return null;
+    const a = await sharp(HELP_SCREEN_PATH).ensureAlpha().raw().toBuffer();
+    const b = await sharp(userImgPath).resize(w, h).ensureAlpha().raw().toBuffer();
+    let sx = 0;
+    let sy = 0;
+    let cnt = 0;
+    for (let i = 0; i + 3 < a.length; i += 4) {
+      const diff = Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+      if (diff > 120) {
+        // 明显差异像素（用户涂鸦）
+        const px = (i / 4) % w;
+        const py = Math.floor(i / 4 / w);
+        sx += px;
+        sy += py;
+        cnt += 1;
+      }
+    }
+    if (cnt < 30) return null; // 差异太少，不是圈选
+    return { x: sx / cnt, y: sy / cnt, w, h };
+  } catch (err) {
+    logger.warn(`圈选对比失败: ${String(err)}`);
+    return null;
+  }
+}
 
 /** 最近收到的文件（每用户，最多保留 5 个），供后续文字消息中的「这个文件/模板」指代。 */
 const recentInboundFiles = new Map<string, { path: string; at: number }[]>();
@@ -356,6 +394,38 @@ async function handleMessage(
     }
   }
 
+  // 人圈猫点：用户发回圈选图 → 对比求助截图找圈中心 → 注入点击坐标
+  if (mediaKind === "image" && mediaImages.length > 0) {
+    try {
+      const helpStat = fs.existsSync(HELP_SCREEN_PATH) ? fs.statSync(HELP_SCREEN_PATH) : null;
+      if (helpStat && Date.now() - helpStat.mtimeMs < HELP_WINDOW_MS) {
+        const center = await findCircleCenter(mediaImages[0]);
+        if (center) {
+          const sizeOut = execFileSync(
+            "python",
+            ["-c", "import pyautogui; s=pyautogui.size(); print(s.width, s.height)"],
+            { timeout: 15_000, encoding: "utf-8", windowsHide: true },
+          );
+          const [sw, sh] = sizeOut.trim().split(/\s+/).map(Number);
+          const clickX = Math.round((center.x / center.w) * sw);
+          const clickY = Math.round((center.y / center.h) * sh);
+          prompt = `[用户在截图上圈出了目标位置，对应屏幕坐标 (${clickX}, ${clickY})。立即用 run_python 执行 pyautogui.click(${clickX}, ${clickY})，然后用 see_screen 确认点击效果。]`;
+          mediaImages.length = 0;
+          mediaKind = undefined;
+          mediaPath = undefined;
+          try {
+            fs.unlinkSync(HELP_SCREEN_PATH);
+          } catch {
+            // best-effort
+          }
+          logger.info(`圈选坐标: (${clickX}, ${clickY})`);
+        }
+      }
+    } catch (err) {
+      logger.warn(`圈选匹配失败: ${String(err)}`);
+    }
+  }
+
   // 图片全部走视觉（一条消息内多张图全部收集）
   if (mediaKind === "image" && mediaImages.length > 0) {
     for (const picPath of mediaImages) {
@@ -419,6 +489,24 @@ async function handleMessage(
     });
   }
   if (reply) emitProgress("reply_sent", reply.slice(0, 400));
+
+  // 模型请求人机协作：把求助截图发给用户圈选
+  try {
+    const helpStat = fs.existsSync(HELP_SCREEN_PATH) ? fs.statSync(HELP_SCREEN_PATH) : null;
+    if (helpStat && Date.now() - helpStat.mtimeMs < 120_000) {
+      await sendWeixinMediaFile({
+        filePath: HELP_SCREEN_PATH,
+        to: from,
+        text: "",
+        opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken },
+        cdnBaseUrl: CDN_BASE_URL,
+      });
+      logger.info(`求助截图已发送 from=${from}`);
+      emitProgress("file_sent", "求助截图（等用户圈选）");
+    }
+  } catch (err) {
+    logger.warn(`求助截图发送失败: ${String(err)}`);
+  }
 
   // 生成的文件逐个发回微信（已不存在的跳过——模型可能中途重命名/删除）
   for (const filePath of files) {
