@@ -90,6 +90,11 @@ export function getContextToken(userId: string): string | undefined {
   return ctxTokenCache.get(userId);
 }
 
+/** 所有建立过会话的用户 ID（用于主动发消息，如上线通知）。 */
+export function getAllContextUserIds(): string[] {
+  return [...ctxTokenCache.keys()];
+}
+
 // ---------------------------------------------------------------------------
 // 每用户聊天历史
 // ---------------------------------------------------------------------------

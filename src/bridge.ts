@@ -20,6 +20,7 @@ import {
   restoreContextTokens,
   setContextToken,
   getContextToken,
+  getAllContextUserIds,
 } from "./state.js";
 import { askClaude } from "./chat.js";
 import type { ImageInput } from "./chat.js";
@@ -498,6 +499,22 @@ export async function startBridge(): Promise<void> {
   await notifyStart(opts).catch(() => {
     /* 通知失败不阻断启动 */
   });
+
+  // 上线通知：向绑定用户发一条消息（BRIDGE_ONLINE_MESSAGE 可自定义）
+  const onlineMessage = process.env.BRIDGE_ONLINE_MESSAGE || "小猫在";
+  const onlineTargets = getAllContextUserIds().length > 0 ? getAllContextUserIds() : bot.userId ? [bot.userId] : [];
+  for (const to of onlineTargets) {
+    try {
+      await sendMessageApi({
+        baseUrl,
+        token,
+        body: buildTextSendBody(to, onlineMessage, getContextToken(to)),
+      });
+      logger.info(`上线消息已发送 to=${to}`);
+    } catch (err) {
+      logger.warn(`上线消息发送失败 to=${to}: ${String(err)}`);
+    }
+  }
 
   const shutdown = (): void => {
     logger.info("收到退出信号，通知微信服务端停止...");
