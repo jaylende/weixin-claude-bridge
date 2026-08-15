@@ -10,6 +10,7 @@ import { loadChatFile, saveChatFile } from "./state.js";
 import type { ChatMessage } from "./state.js";
 import { emitProgress } from "./progress.js";
 import { webSearch, webFetch } from "./search.js";
+import { parseScreen } from "./screen.js";
 
 /** 模型：ANTHROPIC_MODEL 可覆盖，默认跟随官方推荐。 */
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5";
@@ -78,7 +79,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "run_python",
     description:
-      "在电脑上执行 Python 代码生成/处理文件或控制电脑。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome、pyautogui（模拟鼠标键盘控制电脑：定位屏幕元素、点击、输入文字）。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。\n\n【命名约定】下划线 _ 开头的文件是临时文件（截图、中间数据），不会发回微信；其他文件会被当作成果发回，不要写多余的中间文件。\n\n【电脑控制规范】用 pyautogui 时：确认屏幕状态请用 see_screen 工具（不要在本目录保存截图）；用 locateOnScreen/locateCenterOnScreen 定位按钮；操作前先确认目标窗口存在（pyautogui.getWindowsWithTitle）；每次动作要小步、可验证，禁止盲目连续点击。",
+      "在电脑上执行 Python 代码生成/处理文件或控制电脑。可用库：python-docx、openpyxl、reportlab、PIL、pymupdf（import pymupdf 读写 PDF）、pdfplumber、pypdf、pycryptodome、pyautogui（模拟鼠标键盘：点击、输入、滚动）、pywinauto（标准 Windows 程序按控件名操作，比坐标点击更稳）。产物保存到当前工作目录（os.getcwd()）。读输入文件用绝对路径。\n\n【重要】修改 Word 文档（如按模板填写报告）：必须先复制模板文件（shutil.copy），再用 python-docx 打开副本修改内容并另存——严禁从零创建 docx，否则模板格式（封面/表格/样式）全部丢失。旧版 .doc 模板先用 subprocess 调 LibreOffice 转换：soffice --headless --convert-to docx。\n\n【命名约定】下划线 _ 开头的文件是临时文件（截图、中间数据），不会发回微信；其他文件会被当作成果发回，不要写多余的中间文件。\n\n【电脑控制规范】点击屏幕元素前必须先调 see_screen 获取精确坐标（不要猜坐标）；标准 Windows 程序（记事本/计算器/资源管理器/设置）优先用 pywinauto 按控件名操作；每次动作小步、可验证，禁止盲目连续点击。",
     input_schema: {
       type: "object",
       properties: {
@@ -102,7 +103,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "see_screen",
     description:
-      "截取电脑当前屏幕并经视觉模型识别，返回屏幕内容的文字描述（有哪些窗口、按钮位置、界面状态）。操作电脑前后用它确认屏幕状态，不要盲操作。",
+      "查看电脑当前屏幕：返回带精确像素坐标的可交互元素列表（窗口、按钮、图标、输入框等，每个元素有编号、文字和点击坐标）。操作电脑前后用它确认屏幕状态；想点击某个元素时，用 run_python 执行 pyautogui.click(元素坐标)。不要凭文字描述猜坐标，坐标以本工具输出为准。",
     input_schema: {
       type: "object",
       properties: {},
@@ -163,28 +164,38 @@ async function executeWriteFile(
   return `已写入 ${path.basename(target)}（${content.length} 字符${isTemp ? "，临时文件不会发回微信" : ""}）`;
 }
 
-/** 截屏并经视觉模型（GLM）转文字描述，让模型"看到"电脑屏幕。 */
+/**
+ * 看屏幕：优先 OmniParser（带坐标的元素列表，本地解析）；
+ * 不可用时降级为 GLM 视觉描述。
+ */
 async function executeSeeScreen(): Promise<string> {
-  if (!VISION_API_KEY) return "错误：未配置视觉模型（VISION_API_KEY），无法识别屏幕内容";
-  fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
-  const pngName = `_screen_${Date.now()}.png`;
-  const pngPath = path.join(OUTPUTS_DIR, pngName);
   try {
-    execFileSync(
-      "python",
-      ["-c", `import pyautogui; pyautogui.screenshot().save(r'${pngPath.replace(/\\/g, "\\\\")}')`],
-      { timeout: 30_000, windowsHide: true },
-    );
-    const buf = fs.readFileSync(pngPath);
-    const desc = await describeImages([{ data: buf.toString("base64"), mediaType: "image/png" }]);
-    return `屏幕内容描述（分辨率 2560x1600）：\n${desc}\n（可用 pyautogui.locateOnScreen 或 pyautogui.getWindowsWithTitle 配合定位具体元素）`;
-  } catch (err) {
-    return `截屏/识别失败: ${String(err).slice(0, 200)}`;
-  } finally {
+    return await parseScreen();
+  } catch (omniErr) {
+    if (!VISION_API_KEY) {
+      return `屏幕解析不可用（OmniParser: ${String(omniErr).slice(0, 100)}；且未配置视觉模型）。请用 pyautogui.getWindowsWithTitle 获取窗口列表。`;
+    }
+    // 降级：GLM 视觉描述
+    fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
+    const pngName = `_screen_${Date.now()}.png`;
+    const pngPath = path.join(OUTPUTS_DIR, pngName);
     try {
-      fs.unlinkSync(pngPath);
-    } catch {
-      // best-effort
+      execFileSync(
+        "python",
+        ["-c", `import pyautogui; pyautogui.screenshot().save(r'${pngPath.replace(/\\/g, "\\\\")}')`],
+        { timeout: 30_000, windowsHide: true },
+      );
+      const buf = fs.readFileSync(pngPath);
+      const desc = await describeImages([{ data: buf.toString("base64"), mediaType: "image/png" }]);
+      return `屏幕内容描述（视觉识别，无精确坐标）：\n${desc}\n（OmniParser 暂不可用：${String(omniErr).slice(0, 80)}）`;
+    } catch (err) {
+      return `截屏/识别失败: ${String(err).slice(0, 200)}`;
+    } finally {
+      try {
+        fs.unlinkSync(pngPath);
+      } catch {
+        // best-effort
+      }
     }
   }
 }

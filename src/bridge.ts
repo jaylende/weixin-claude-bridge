@@ -25,6 +25,7 @@ import {
 import { askClaude } from "./chat.js";
 import type { ImageInput } from "./chat.js";
 import { startProgressServer, emitProgress } from "./progress.js";
+import { stopOmniParser } from "./screen.js";
 import { downloadMediaFromItem } from "./vendor/media/media-download.js";
 import { sendWeixinMediaFile } from "./vendor/messaging/send-media.js";
 import { getMimeFromFilename } from "./vendor/media/mime.js";
@@ -559,6 +560,7 @@ export async function startBridge(): Promise<void> {
   const shutdown = (): void => {
     logger.info("收到退出信号，通知微信服务端停止...");
     clearInterval(refreshTimer);
+    stopOmniParser();
     releaseInstanceLock();
     void notifyStop(opts).catch(() => {});
     process.exit(0);
