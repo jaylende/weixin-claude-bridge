@@ -145,14 +145,15 @@ function isMediaItem(item: MessageItem): boolean {
 /** 纯媒体消息无附带要求时的引导回复（合并窗口内没有文字消息到达）。 */
 async function replyMediaReceived(
   from: string,
-  mediaPath: string,
-  mediaKind: string,
+  items: { mediaPath: string; mediaKind: string }[],
   opts: { baseUrl: string; token: string },
 ): Promise<void> {
-  const label = (
-    { image: "图片", video: "视频", file: "文件", voice: "语音" } as Record<string, string>
-  )[mediaKind] ?? "文件";
-  const text = `已收到${label}（${path.basename(mediaPath)}）。请告诉我你想对它做什么？`;
+  const imgCount = items.filter((i) => i.mediaKind === "image").length;
+  const fileItems = items.filter((i) => i.mediaKind !== "image");
+  const parts: string[] = [];
+  if (imgCount > 0) parts.push(`${imgCount} 张图片`);
+  if (fileItems.length > 0) parts.push(`${fileItems.length} 个文件（${fileItems.map((f) => path.basename(f.mediaPath)).join("、")}）`);
+  const text = `已收到${parts.join("、")}。请告诉我你想让我做什么？`;
   try {
     await sendMessageApi({
       baseUrl: opts.baseUrl,
@@ -239,14 +240,18 @@ function rememberInboundFile(userId: string, filePath: string): void {
 }
 
 /**
- * 待合并的媒体消息：微信把「文件+要求」拆成两条消息（文件在前），
- * 文件消息先挂起 3.5 秒，等文字要求到达后合并成一次处理，避免重复回复。
+ * 待合并的媒体消息队列：微信把「图片×N / 文件+要求」拆成多条消息（媒体在前），
+ * 媒体消息先挂起，等文字要求到达后合并成一次处理，避免重复回复/丢图。
  */
 const pendingMediaByUser = new Map<
   string,
-  { mediaPath: string; mediaKind: "image" | "video" | "file" | "voice"; contextToken?: string; timer: NodeJS.Timeout }
+  {
+    items: { mediaPath: string; mediaKind: "image" | "video" | "file" | "voice" }[];
+    contextToken?: string;
+    timer: NodeJS.Timeout;
+  }
 >();
-const MEDIA_MERGE_WINDOW_MS = 3500;
+const MEDIA_MERGE_WINDOW_MS = 6000;
 
 async function handleMessage(
   msg: WeixinMessage,
@@ -259,10 +264,12 @@ async function handleMessage(
   const text = extractText(msg.item_list).trim();
 
   // 媒体：下载 + 解密（微信 CDN 内容为 AES-128-ECB 加密）
+  // 一条消息可含多张图（多选发送），全部收集
   let mediaPath: string | undefined;
   let mediaKind: "image" | "video" | "file" | "voice" | undefined;
-  const mediaItem = (msg.item_list ?? []).find(isMediaItem);
-  if (mediaItem) {
+  const mediaImages: string[] = [];
+  const mediaItems = (msg.item_list ?? []).filter(isMediaItem);
+  for (const mediaItem of mediaItems) {
     try {
       const saved = await downloadMediaFromItem(mediaItem, {
         cdnBaseUrl: CDN_BASE_URL,
@@ -271,8 +278,11 @@ async function handleMessage(
         errLog: (m) => logger.error(m),
         label: `from=${from}`,
       });
-      if (saved.decryptedPicPath) { mediaPath = saved.decryptedPicPath; mediaKind = "image"; }
-      else if (saved.decryptedVideoPath) { mediaPath = saved.decryptedVideoPath; mediaKind = "video"; }
+      if (saved.decryptedPicPath) {
+        mediaImages.push(saved.decryptedPicPath);
+        mediaPath = saved.decryptedPicPath;
+        mediaKind = "image";
+      } else if (saved.decryptedVideoPath) { mediaPath = saved.decryptedVideoPath; mediaKind = "video"; }
       else if (saved.decryptedFilePath) {
         mediaPath = saved.decryptedFilePath;
         mediaKind = "file";
@@ -285,7 +295,10 @@ async function handleMessage(
     }
   }
 
-  if (!text && !mediaPath) return;
+  if (!text && !mediaPath) {
+    logger.debug(`跳过空消息 from=${from}`);
+    return;
+  }
 
   const contextToken = msg.context_token || getContextToken(from);
   if (msg.context_token) setContextToken(from, msg.context_token);
@@ -295,41 +308,66 @@ async function handleMessage(
     rememberInboundFile(from, mediaPath);
   }
 
-  // 纯媒体消息：挂起 3.5 秒等文字要求，合并成一次处理（微信把「文件+要求」拆成两条消息）
+  // 构造给模型的输入：图片走视觉；其他媒体只告知保存路径
+  let prompt = text;
+  let images: ImageInput[] | undefined;
+
+  // 纯媒体消息：加入挂起队列，等文字要求合并（微信把「多图/文件+要求」拆成多条消息）
   if (mediaPath && !text) {
-    const pending = { mediaPath, mediaKind: mediaKind!, contextToken };
+    const pending = pendingMediaByUser.get(from);
+    if (pending) clearTimeout(pending.timer);
+    const items = pending?.items ?? [];
+    if (!items.some((i) => i.mediaPath === mediaPath)) {
+      items.push({ mediaPath, mediaKind: mediaKind! });
+    }
     const timer = setTimeout(() => {
       pendingMediaByUser.delete(from);
-      void replyMediaReceived(from, pending.mediaPath, pending.mediaKind, opts);
+      void replyMediaReceived(from, items, opts);
     }, MEDIA_MERGE_WINDOW_MS);
-    pendingMediaByUser.set(from, { ...pending, timer });
+    pendingMediaByUser.set(from, { items, contextToken, timer });
     return;
   }
 
-  // 文字消息：若 3.5 秒内有挂起的媒体消息，合并进来一起处理
+  // 文字消息：合并挂起队列里的媒体（多张图片全部走视觉）
   if (text && !mediaPath) {
     const pending = pendingMediaByUser.get(from);
     if (pending) {
       clearTimeout(pending.timer);
       pendingMediaByUser.delete(from);
-      mediaPath = pending.mediaPath;
-      mediaKind = pending.mediaKind;
+      for (const item of pending.items) {
+        if (item.mediaKind === "image") {
+          try {
+            const size = fs.statSync(item.mediaPath).size;
+            if (size <= MAX_IMAGE_BYTES_FOR_MODEL) {
+              (images ??= []).push({
+                data: fs.readFileSync(item.mediaPath).toString("base64"),
+                mediaType: getMimeFromFilename(item.mediaPath) || "image/jpeg",
+              });
+            }
+          } catch (err) {
+            logger.warn(`合并图片失败 ${item.mediaPath}: ${String(err)}`);
+          }
+        } else {
+          mediaPath = item.mediaPath;
+          mediaKind = item.mediaKind;
+        }
+      }
     }
   }
 
-  // 构造给模型的输入：图片走视觉；其他媒体只告知保存路径
-  let prompt = text;
-  let images: ImageInput[] | undefined;
-  if (mediaKind === "image" && mediaPath) {
-    const size = fs.statSync(mediaPath).size;
-    if (size <= MAX_IMAGE_BYTES_FOR_MODEL) {
-      images = [{
-        data: fs.readFileSync(mediaPath).toString("base64"),
-        mediaType: getMimeFromFilename(mediaPath) || "image/jpeg",
-      }];
-    } else {
-      const note = `[用户发了一张 ${(size / 1024 / 1024).toFixed(1)}MB 的大图，已保存到 ${mediaPath}，当前模型无法查看]`;
-      prompt = prompt ? `${prompt}\n${note}` : note;
+  // 图片全部走视觉（一条消息内多张图全部收集）
+  if (mediaKind === "image" && mediaImages.length > 0) {
+    for (const picPath of mediaImages) {
+      const size = fs.statSync(picPath).size;
+      if (size <= MAX_IMAGE_BYTES_FOR_MODEL) {
+        (images ??= []).push({
+          data: fs.readFileSync(picPath).toString("base64"),
+          mediaType: getMimeFromFilename(picPath) || "image/jpeg",
+        });
+      } else {
+        const note = `[用户发了一张 ${(size / 1024 / 1024).toFixed(1)}MB 的大图，已保存到 ${picPath}，当前模型无法查看]`;
+        prompt = prompt ? `${prompt}\n${note}` : note;
+      }
     }
   } else if (mediaPath) {
     const kindLabel = (
@@ -456,10 +494,12 @@ function releaseInstanceLock(): void {
 
 const recentMessageKeys = new Set<string>();
 
-/** 消息去重 key；无 ID 的消息返回 null（不去重）。 */
+/** 消息去重 key（含内容签名，避免微信对同一 ID 的多条推送误杀）；无 ID 的消息返回 null（不去重）。 */
 function dedupeKey(msg: WeixinMessage): string | null {
-  if (msg.message_id) return `mid:${msg.message_id}`;
-  if (msg.seq != null && msg.create_time_ms) return `seq:${msg.seq}:${msg.create_time_ms}`;
+  const items = msg.item_list ?? [];
+  const signature = `${items.length}:${items.map((i) => i.type ?? 0).join(",")}`;
+  if (msg.message_id) return `mid:${msg.message_id}:${signature}`;
+  if (msg.seq != null && msg.create_time_ms) return `seq:${msg.seq}:${msg.create_time_ms}:${signature}`;
   return null;
 }
 
