@@ -1,14 +1,11 @@
 @echo off
-rem Weixin-Claude bridge keep-alive wrapper: restarts the bridge if it exits.
-rem 管理员提权：让桥可以控制管理员窗口（如 WeGame），开机时弹一次 UAC 确认。
-rem 参数 noprompt 可跳过提权（普通权限运行）。
-if /i "%~1" neq "noprompt" (
-  net session >nul 2>&1
-  if %errorlevel% neq 0 (
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-    exit /b
-  )
-)
+rem Weixin-Claude bridge keep-alive wrapper.
+rem Self-minimize: relaunch minimized if not already.
+if "%MINIMIZED%"=="1" goto :main
+set MINIMIZED=1
+start /min cmd /c "%~f0" %*
+exit /b
+:main
 cd /d C:\Users\Jaylen\weixin-claude-bridge
 :loop
 echo [%date% %time%] starting bridge...
