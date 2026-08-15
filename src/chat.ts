@@ -27,7 +27,8 @@ const SYSTEM_PROMPT = [
   "- 处理用户发来的文件时：优先用现成库（PDF 用 pymupdf/pdfplumber，Word 用 python-docx，Excel 用 openpyxl）。如果文件无法读取、解析失败或格式不支持，直接告知用户「无法识别这个文件」并说明原因，不要反复尝试不同的方法，也不要生成无关文件。",
   "- 按模板填写/修改 Word 文档时：必须复制模板文件后在其上修改（shutil.copy 模板 → python-docx 打开副本 → 改内容 → 另存），严禁从零新建 docx——模板的封面、表格、字体样式必须原样保留。旧版 .doc 模板先用 LibreOffice（soffice --headless --convert-to docx）转换。",
   "- 涉及时事新闻、最新数据、实时信息、你不确定的事实时，必须先用 web_search 搜索，必要时用 web_fetch 读取具体页面，再综合回答。禁止凭训练记忆编造近期信息。",
-  "- 用户要求操作电脑（打开应用、点击、输入等）时：用 run_python + pyautogui 执行。每步操作后截图确认，小步慢走；目标元素找不到就截图分析再试；涉及金钱、删除文件、卸载软件等危险操作必须先向用户确认。",
+  "- 用户要求操作电脑（打开应用、点击、输入等）时：用 run_python + pyautogui 执行。每步操作后截图确认，小步慢走；涉及金钱、删除文件、卸载软件等危险操作必须先向用户确认。",
+  "- 找目标元素（按钮/图标）时最多用 see_screen 看屏 2 次：第一次定位坐标，第二次确认点击结果。若 2 次后仍找不到目标或点击无效，立即调用 request_user_help 请用户圈选，不要继续反复尝试。",
 ].join("\n");
 
 /**
@@ -451,6 +452,8 @@ export async function askClaude(
   history.push({ role: "user", content: historyText });
 
   const MAX_TOOL_ROUNDS = 12;
+  /** 找目标时最多看屏次数：超过就转人机协作（截图让用户圈选），避免反复折腾。 */
+  const MAX_SEE_SCREEN_ATTEMPTS = 2;
 
   const run = async (withImages: boolean, overrideText?: string): Promise<AskResult> => {
     const generated = collectGeneratedFiles();
@@ -475,6 +478,7 @@ export async function askClaude(
 
     let final = await streamOnce(apiMessages);
     let rounds = 0;
+    let seeScreenCount = 0;
 
     // 工具循环：模型要调工具就执行并把结果回传，直到给出最终文本
     while (final.stop_reason === "tool_use" && rounds < MAX_TOOL_ROUNDS) {
@@ -495,7 +499,15 @@ export async function askClaude(
           } else if (block.name === "run_python") {
             resultText = await executeRunPython(block.input as { code?: string }, generated);
           } else if (block.name === "see_screen") {
-            resultText = await executeSeeScreen();
+            seeScreenCount += 1;
+            if (seeScreenCount > MAX_SEE_SCREEN_ATTEMPTS) {
+              // 硬约束：多次看屏仍未定位 → 直接转人机协作
+              await executeRequestUserHelp();
+              resultText =
+                "已自动切换为人机协作：屏幕截图已发给用户圈选。立即结束本轮回复（用简短文字告知用户已发截图、请圈出目标后发回），不要再用任何工具。";
+            } else {
+              resultText = await executeSeeScreen();
+            }
           } else if (block.name === "request_user_help") {
             resultText = await executeRequestUserHelp();
           } else if (block.name === "read_pdf_pages") {
