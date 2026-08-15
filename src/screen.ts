@@ -48,7 +48,16 @@ export async function ensureOmniParser(): Promise<void> {
       "--port",
       String(OMNI_PORT),
     ],
-    { cwd: OMNI_SERVER_DIR, stdio: "ignore", windowsHide: true },
+    {
+      cwd: OMNI_SERVER_DIR,
+      stdio: "ignore",
+      windowsHide: true,
+      env: {
+        ...process.env,
+        HF_HUB_OFFLINE: "1",
+        TRANSFORMERS_OFFLINE: "1",
+      },
+    },
   );
   for (let i = 0; i < 90; i++) {
     await sleep(2000);
