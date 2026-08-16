@@ -629,8 +629,8 @@ export async function startBridge(): Promise<void> {
     /* 通知失败不阻断启动 */
   });
 
-  // 上线通知：向绑定用户发一条消息（BRIDGE_ONLINE_MESSAGE 可自定义）
-  const onlineMessage = process.env.BRIDGE_ONLINE_MESSAGE || "小猫在";
+  // 上线通知：向绑定用户发一条消息（BRIDGE_ONLINE_MESSAGE 可自定义，如「小猫在」）
+  const onlineMessage = process.env.BRIDGE_ONLINE_MESSAGE || "助手已上线";
   const onlineTargets = getAllContextUserIds().length > 0 ? getAllContextUserIds() : bot.userId ? [bot.userId] : [];
   for (const to of onlineTargets) {
     try {
