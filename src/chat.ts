@@ -6,7 +6,16 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { logger } from "./vendor/logger.js";
-import { loadChatFile, saveChatFile } from "./state.js";
+import {
+  loadChatFile,
+  saveChatFile,
+  loadNotes,
+  addNote,
+  deleteNote,
+  loadReminders,
+  addReminder,
+  removeReminder,
+} from "./state.js";
 import type { ChatMessage } from "./state.js";
 import { emitProgress } from "./progress.js";
 import { webSearch, webFetch } from "./search.js";
@@ -121,6 +130,71 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: "send_screenshot",
+    description:
+      "截取电脑当前屏幕并把截图发送给用户（用户要求看屏幕/截屏时用这个，而不是 see_screen）。",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "system_status",
+    description: "查询电脑运行状态（CPU/内存占用、电池电量、磁盘空间、开机时长）。用户问电脑状态时用。",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "add_note",
+    description: "帮用户记一条便签。用户说「记一下…」「帮我记着…」时调用。",
+    input_schema: {
+      type: "object",
+      properties: { text: { type: "string", description: "便签内容" } },
+      required: ["text"],
+    },
+  },
+  {
+    name: "list_notes",
+    description: "列出用户的所有便签。用户说「我的便签」「我之前记了什么」时调用。",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "delete_note",
+    description: "删除一条便签。",
+    input_schema: {
+      type: "object",
+      properties: { id: { type: "number", description: "便签编号" } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "set_reminder",
+    description:
+      "设置提醒：到时间主动给用户发微信消息。用户说「X 分钟后提醒我」「今天下午 3 点提醒我」「每天早上 8 点提醒我」时调用。",
+    input_schema: {
+      type: "object",
+      properties: {
+        at: {
+          type: "string",
+          description: "提醒时间：HH:mm（如 08:00）或 YYYY-MM-DD HH:mm（如 2026-08-16 15:30），或分钟数形式请换算为具体时间",
+        },
+        message: { type: "string", description: "提醒内容（发到微信的文字）" },
+        daily: { type: "boolean", description: "是否每天重复（默认 false）" },
+      },
+      required: ["at", "message"],
+    },
+  },
+  {
+    name: "list_reminders",
+    description: "列出所有未完成的提醒。用户问「我有哪些提醒」时调用。",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "cancel_reminder",
+    description: "取消一条提醒。",
+    input_schema: {
+      type: "object",
+      properties: { id: { type: "number", description: "提醒编号" } },
+      required: ["id"],
+    },
+  },
+  {
     name: "web_search",
     description:
       "搜索网络获取最新信息（时事新闻、实时数据、不确定的事实等）。涉及最新/实时信息时必须先搜索再回答，不要凭训练记忆编造。",
@@ -227,6 +301,63 @@ async function executeRequestUserHelp(): Promise<string> {
   } catch (err) {
     return `截图失败: ${String(err).slice(0, 150)}`;
   }
+}
+
+/** 主动截图：存到指定路径，桥检测后发给用户。 */
+export const SEND_SCREEN_PATH = path.join(process.env.BRIDGE_STATE_DIR || "state", "tmp", "send_screen.png");
+
+async function executeSendScreenshot(): Promise<string> {
+  fs.mkdirSync(path.dirname(SEND_SCREEN_PATH), { recursive: true });
+  try {
+    execFileSync(
+      "python",
+      ["-c", `import pyautogui; pyautogui.screenshot().save(r'${SEND_SCREEN_PATH.replace(/\\/g, "\\\\")}')`],
+      { timeout: 30_000, windowsHide: true },
+    );
+    return "截屏已保存，将发送给用户。";
+  } catch (err) {
+    return `截屏失败: ${String(err).slice(0, 150)}`;
+  }
+}
+
+/** 电脑运行状态（psutil）。 */
+async function executeSystemStatus(): Promise<string> {
+  try {
+    const out = execFileSync(
+      "python",
+      [
+        "-c",
+        [
+          "import psutil",
+          "cpu=psutil.cpu_percent(interval=0.5)",
+          "mem=psutil.virtual_memory()",
+          "bat=psutil.sensors_battery()",
+          "disk=psutil.disk_usage('C:')",
+          "print(f'CPU: {cpu}% | 内存: {mem.percent}% ({mem.used/1073741824:.1f}/{mem.total/1073741824:.1f}GB)')",
+          "print(f'电池: {int(bat.percent)}% {\"充电中\" if bat.power_plugged else \"用电池\"}' if bat else '电池: 无')",
+          "print(f'磁盘C: {disk.percent}% ({disk.free/1073741824:.1f}GB 可用)')",
+        ].join(";"),
+      ],
+      { timeout: 30_000, encoding: "utf-8", windowsHide: true },
+    );
+    return out.trim();
+  } catch (err) {
+    return `查询失败: ${String(err).slice(0, 150)}`;
+  }
+}
+
+/** 解析提醒时间："HH:mm" 或 "YYYY-MM-DD HH:mm" → 毫秒时间戳；失败返回 null。 */
+function parseReminderTime(s: string, daily: boolean): number | null {
+  const now = new Date();
+  const m = s.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const target = new Date(now);
+    target.setHours(Number(m[1]), Number(m[2]), 0, 0);
+    if (!daily && target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+    return target.getTime();
+  }
+  const t = new Date(s.trim().replace(" ", "T"));
+  return Number.isNaN(t.getTime()) ? null : t.getTime();
 }
 
 /** PDF 提取脚本（pymupdf 抽文字层 + 无文字页渲染 PNG）。 */
@@ -511,6 +642,52 @@ export async function askClaude(
             }
           } else if (block.name === "request_user_help") {
             resultText = await executeRequestUserHelp();
+          } else if (block.name === "send_screenshot") {
+            resultText = await executeSendScreenshot();
+          } else if (block.name === "system_status") {
+            resultText = await executeSystemStatus();
+          } else if (block.name === "add_note") {
+            const noteText = String((block.input as { text?: string }).text ?? "").trim();
+            if (!noteText) {
+              resultText = "错误：缺少 text";
+            } else {
+              const note = addNote(noteText);
+              resultText = `已记下便签 #${note.id}`;
+            }
+          } else if (block.name === "list_notes") {
+            const notes = loadNotes();
+            resultText = notes.length
+              ? notes.map((n) => `#${n.id} ${n.text}（${new Date(n.at).toLocaleString("zh-CN", { hour12: false })}）`).join("\n")
+              : "（暂无便签）";
+          } else if (block.name === "delete_note") {
+            const id = Number((block.input as { id?: number }).id);
+            resultText = deleteNote(id) ? `已删除便签 #${id}` : `未找到便签 #${id}`;
+          } else if (block.name === "set_reminder") {
+            const input = block.input as { at?: string; message?: string; daily?: boolean };
+            const atStr = String(input.at ?? "").trim();
+            const message = String(input.message ?? "").trim();
+            const daily = Boolean(input.daily);
+            if (!atStr || !message) {
+              resultText = "错误：at 和 message 必填";
+            } else {
+              const at = parseReminderTime(atStr, daily);
+              if (at === null) {
+                resultText = `时间格式无法解析（${atStr}）。请用 HH:mm 或 YYYY-MM-DD HH:mm`;
+              } else {
+                const r = addReminder({ userId, at, message, daily });
+                resultText = `提醒 #${r.id} 已设置：${new Date(at).toLocaleString("zh-CN", { hour12: false })}${daily ? "（每天重复）" : ""} - ${message}`;
+              }
+            }
+          } else if (block.name === "list_reminders") {
+            const list = loadReminders().filter((r) => !r.done);
+            resultText = list.length
+              ? list
+                  .map((r) => `#${r.id} ${new Date(r.at).toLocaleString("zh-CN", { hour12: false })}${r.daily ? "（每天）" : ""} - ${r.message}`)
+                  .join("\n")
+              : "（暂无提醒）";
+          } else if (block.name === "cancel_reminder") {
+            const id = Number((block.input as { id?: number }).id);
+            resultText = removeReminder(id) ? `已取消提醒 #${id}` : `未找到提醒 #${id}`;
           } else if (block.name === "read_pdf_pages") {
             resultText = await executeReadPdfPages(block.input as { path?: string });
           } else if (block.name === "web_search") {

@@ -96,6 +96,88 @@ export function getAllContextUserIds(): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// 便签本（用户经微信记的事）
+// ---------------------------------------------------------------------------
+
+export type Note = { id: number; text: string; at: number };
+
+const notesPath = () => path.join(STATE_DIR, "notes.json");
+let notesCache: Note[] | null = null;
+
+export function loadNotes(): Note[] {
+  if (notesCache) return notesCache;
+  const data = readJson<Note[]>(notesPath());
+  notesCache = Array.isArray(data) ? data : [];
+  return notesCache;
+}
+
+export function addNote(text: string): Note {
+  const notes = loadNotes();
+  const note: Note = { id: (notes.at(-1)?.id ?? 0) + 1, text, at: Date.now() };
+  notes.push(note);
+  writeJson(notesPath(), notes);
+  return note;
+}
+
+/** 删除成功返回 true。 */
+export function deleteNote(id: number): boolean {
+  const notes = loadNotes();
+  const idx = notes.findIndex((n) => n.id === id);
+  if (idx < 0) return false;
+  notes.splice(idx, 1);
+  writeJson(notesPath(), notes);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 定时提醒（桥每分钟检查，到点主动发微信）
+// ---------------------------------------------------------------------------
+
+export type Reminder = {
+  id: number;
+  userId: string;
+  /** 下次触发时间（毫秒时间戳） */
+  at: number;
+  message: string;
+  /** true = 每天重复（触发后自动顺延 24 小时） */
+  daily?: boolean;
+  done?: boolean;
+};
+
+const remindersPath = () => path.join(STATE_DIR, "reminders.json");
+let remindersCache: Reminder[] | null = null;
+
+export function loadReminders(): Reminder[] {
+  if (remindersCache) return remindersCache;
+  const data = readJson<Reminder[]>(remindersPath());
+  remindersCache = Array.isArray(data) ? data : [];
+  return remindersCache;
+}
+
+export function saveReminders(list: Reminder[]): void {
+  remindersCache = list;
+  writeJson(remindersPath(), list);
+}
+
+export function addReminder(r: Omit<Reminder, "id">): Reminder {
+  const list = loadReminders();
+  const item: Reminder = { ...r, id: (list.at(-1)?.id ?? 0) + 1 };
+  list.push(item);
+  saveReminders(list);
+  return item;
+}
+
+/** 删除成功返回 true。 */
+export function removeReminder(id: number): boolean {
+  const list = loadReminders();
+  const idx = list.findIndex((r) => r.id === id);
+  if (idx < 0) return false;
+  list.splice(idx, 1);
+  saveReminders(list);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // 每用户聊天历史
 // ---------------------------------------------------------------------------
 

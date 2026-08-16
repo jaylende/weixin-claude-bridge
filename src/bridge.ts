@@ -21,8 +21,10 @@ import {
   setContextToken,
   getContextToken,
   getAllContextUserIds,
+  loadReminders,
+  saveReminders,
 } from "./state.js";
-import { askClaude, HELP_SCREEN_PATH } from "./chat.js";
+import { askClaude, HELP_SCREEN_PATH, SEND_SCREEN_PATH } from "./chat.js";
 import type { ImageInput } from "./chat.js";
 import sharp from "sharp";
 import { startProgressServer, emitProgress } from "./progress.js";
@@ -508,6 +510,24 @@ async function handleMessage(
     logger.warn(`求助截图发送失败: ${String(err)}`);
   }
 
+  // 主动截图：模型调 send_screenshot 时发图给用户
+  try {
+    const shotStat = fs.existsSync(SEND_SCREEN_PATH) ? fs.statSync(SEND_SCREEN_PATH) : null;
+    if (shotStat && Date.now() - shotStat.mtimeMs < 120_000) {
+      await sendWeixinMediaFile({
+        filePath: SEND_SCREEN_PATH,
+        to: from,
+        text: "",
+        opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken },
+        cdnBaseUrl: CDN_BASE_URL,
+      });
+      logger.info(`屏幕截图已发送 from=${from}`);
+      emitProgress("file_sent", "屏幕截图");
+    }
+  } catch (err) {
+    logger.warn(`屏幕截图发送失败: ${String(err)}`);
+  }
+
   // 生成的文件逐个发回微信（已不存在的跳过——模型可能中途重命名/删除）
   for (const filePath of files) {
     if (!fs.existsSync(filePath)) {
@@ -648,6 +668,7 @@ export async function startBridge(): Promise<void> {
   const shutdown = (): void => {
     logger.info("收到退出信号，通知微信服务端停止...");
     clearInterval(refreshTimer);
+    clearInterval(reminderTimer);
     stopOmniParser();
     releaseInstanceLock();
     void notifyStop(opts).catch(() => {});
@@ -669,6 +690,38 @@ export async function startBridge(): Promise<void> {
       .catch((e) => logger.warn(`定时刷新连接失败: ${String(e)}`));
   }, REFRESH_INTERVAL_MS);
   refreshTimer.unref?.();
+
+  // 提醒调度：每分钟检查，到点主动发微信
+  const checkReminders = async (): Promise<void> => {
+    const now = Date.now();
+    const list = loadReminders();
+    let changed = false;
+    for (const r of list) {
+      if (r.done || r.at > now) continue;
+      try {
+        await sendMessageApi({
+          baseUrl,
+          token,
+          body: buildTextSendBody(r.userId, `⏰ 提醒：${r.message}`, getContextToken(r.userId)),
+        });
+        logger.info(`提醒已发送 #${r.id} to=${r.userId}: ${r.message.slice(0, 40)}`);
+        emitProgress("reply_sent", `⏰ 提醒：${r.message.slice(0, 60)}`);
+      } catch (err) {
+        logger.warn(`提醒发送失败 #${r.id}: ${String(err)}`);
+      }
+      if (r.daily) {
+        const d = new Date(r.at);
+        d.setDate(d.getDate() + 1);
+        r.at = d.getTime();
+      } else {
+        r.done = true;
+      }
+      changed = true;
+    }
+    if (changed) saveReminders(list);
+  };
+  const reminderTimer = setInterval(() => void checkReminders(), 60_000);
+  reminderTimer.unref?.();
 
   let getUpdatesBuf = loadSyncBuf();
   let consecutiveFailures = 0;
