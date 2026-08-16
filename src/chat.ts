@@ -39,6 +39,7 @@ const SYSTEM_PROMPT = [
   "- 用户要求操作电脑（打开应用、点击、输入等）时：用 run_python + pyautogui 执行。每步操作后截图确认，小步慢走；涉及金钱、删除文件、卸载软件等危险操作必须先向用户确认。",
   "- 找目标元素（按钮/图标）时最多用 see_screen 看屏 2 次：第一次定位坐标，第二次确认点击结果。若 2 次后仍找不到目标或点击无效，立即调用 request_user_help 请用户圈选，不要继续反复尝试。",
   "- 【新手引导】如果这是用户第一次和你对话（此前没有任何聊天记录），先简短自我介绍并说明你能做什么：日常聊天、接收/生成文件（Word/Excel/PDF/图表）、图片识别、网络搜索、控制电脑。最后提示「发文件或直接说需求即可」。之后再正常回答用户的问题。",
+  "- 【课程表联动】用户发课程表（图片或文件）并要求提醒时：先读取课程表内容，解析出每门课的名称/教室/星期/上课时间，把完整课程表存为一条便签（add_note），然后为每节课单独设置每周重复提醒（set_reminder，at 填上课时间往前倒 20 分钟的时间，weekly 填对应的星期几，message 包含课程名和教室）。如果用户没特别说提前量，默认课前 20 分钟。",
 ].join("\n");
 
 /**
@@ -166,7 +167,7 @@ const TOOLS: Anthropic.Tool[] = [
   {
     name: "set_reminder",
     description:
-      "设置提醒：到时间主动给用户发微信消息。用户说「X 分钟后提醒我」「今天下午 3 点提醒我」「每天早上 8 点提醒我」时调用。",
+      "设置提醒：到时间主动给用户发微信消息。用户说「X 分钟后提醒我」「今天下午 3 点提醒我」「每天早上 8 点提醒我」「每周一三五 9 点提醒我」时调用。",
     input_schema: {
       type: "object",
       properties: {
@@ -175,7 +176,8 @@ const TOOLS: Anthropic.Tool[] = [
           description: "提醒时间：HH:mm（如 08:00）或 YYYY-MM-DD HH:mm（如 2026-08-16 15:30），或分钟数形式请换算为具体时间",
         },
         message: { type: "string", description: "提醒内容（发到微信的文字）" },
-        daily: { type: "boolean", description: "是否每天重复（默认 false）" },
+        daily: { type: "boolean", description: "是否每天重复（默认 false，与 weekly 互斥）" },
+        weekly: { type: "string", description: "每周重复的星期几：1=周一 2=周二 … 7=周日，多个用逗号（如 1,3,5）。与 daily 互斥" },
       },
       required: ["at", "message"],
     },
@@ -347,17 +349,38 @@ async function executeSystemStatus(): Promise<string> {
 }
 
 /** 解析提醒时间："HH:mm" 或 "YYYY-MM-DD HH:mm" → 毫秒时间戳；失败返回 null。 */
-function parseReminderTime(s: string, daily: boolean): number | null {
+function parseReminderTime(s: string, daily: boolean, weeklyDays?: number[]): number | null {
   const now = new Date();
   const m = s.trim().match(/^(\d{1,2}):(\d{2})$/);
   if (m) {
     const target = new Date(now);
     target.setHours(Number(m[1]), Number(m[2]), 0, 0);
-    if (!daily && target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+    if (!daily && target.getTime() <= now.getTime()) {
+      if (weeklyDays?.length) {
+        // 找下一个匹配的星期几
+        for (let i = 1; i <= 7; i++) {
+          target.setDate(target.getDate() + 1);
+          if (weeklyDays.includes(target.getDay())) break;
+        }
+      } else {
+        target.setDate(target.getDate() + 1);
+      }
+    }
     return target.getTime();
   }
   const t = new Date(s.trim().replace(" ", "T"));
   return Number.isNaN(t.getTime()) ? null : t.getTime();
+}
+
+/** 解析 weekly 参数："1,3,5" → [1,3,5]（1=周一…7=周日→0）；失败返回 undefined。 */
+function parseWeeklyDays(s?: string): number[] | undefined {
+  if (!s?.trim()) return undefined;
+  const days = s
+    .split(",")
+    .map((x) => Number(x.trim()))
+    .filter((n) => n >= 1 && n <= 7)
+    .map((n) => (n === 7 ? 0 : n));
+  return days.length ? [...new Set(days)].sort() : undefined;
 }
 
 /** PDF 提取脚本（pymupdf 抽文字层 + 无文字页渲染 PNG）。 */
@@ -663,26 +686,31 @@ export async function askClaude(
             const id = Number((block.input as { id?: number }).id);
             resultText = deleteNote(id) ? `已删除便签 #${id}` : `未找到便签 #${id}`;
           } else if (block.name === "set_reminder") {
-            const input = block.input as { at?: string; message?: string; daily?: boolean };
+            const input = block.input as { at?: string; message?: string; daily?: boolean; weekly?: string };
             const atStr = String(input.at ?? "").trim();
             const message = String(input.message ?? "").trim();
             const daily = Boolean(input.daily);
+            const weeklyDays = parseWeeklyDays(input.weekly);
             if (!atStr || !message) {
               resultText = "错误：at 和 message 必填";
             } else {
-              const at = parseReminderTime(atStr, daily);
+              const at = parseReminderTime(atStr, daily, weeklyDays);
               if (at === null) {
                 resultText = `时间格式无法解析（${atStr}）。请用 HH:mm 或 YYYY-MM-DD HH:mm`;
               } else {
-                const r = addReminder({ userId, at, message, daily });
-                resultText = `提醒 #${r.id} 已设置：${new Date(at).toLocaleString("zh-CN", { hour12: false })}${daily ? "（每天重复）" : ""} - ${message}`;
+                const r = addReminder({ userId, at, message, daily: daily || undefined, weeklyDays });
+                const repeatLabel = daily ? "（每天重复）" : weeklyDays?.length ? `（每周${weeklyDays.map((d) => "日一二三四五六"[d]).join("/")}）` : "";
+                resultText = `提醒 #${r.id} 已设置：${new Date(at).toLocaleString("zh-CN", { hour12: false })}${repeatLabel} - ${message}`;
               }
             }
           } else if (block.name === "list_reminders") {
             const list = loadReminders().filter((r) => !r.done);
             resultText = list.length
               ? list
-                  .map((r) => `#${r.id} ${new Date(r.at).toLocaleString("zh-CN", { hour12: false })}${r.daily ? "（每天）" : ""} - ${r.message}`)
+                  .map((r) => {
+                    const repeat = r.daily ? "（每天）" : r.weeklyDays?.length ? `（每周${r.weeklyDays.map((d) => "日一二三四五六"[d]).join("/")}）` : "";
+                    return `#${r.id} ${new Date(r.at).toLocaleString("zh-CN", { hour12: false })}${repeat} - ${r.message}`;
+                  })
                   .join("\n")
               : "（暂无提醒）";
           } else if (block.name === "cancel_reminder") {

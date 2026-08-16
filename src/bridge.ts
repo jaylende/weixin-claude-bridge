@@ -713,6 +713,13 @@ export async function startBridge(): Promise<void> {
         const d = new Date(r.at);
         d.setDate(d.getDate() + 1);
         r.at = d.getTime();
+      } else if (r.weeklyDays?.length) {
+        const d = new Date(r.at);
+        for (let i = 1; i <= 7; i++) {
+          d.setDate(d.getDate() + 1);
+          if (r.weeklyDays.includes(d.getDay())) break;
+        }
+        r.at = d.getTime();
       } else {
         r.done = true;
       }

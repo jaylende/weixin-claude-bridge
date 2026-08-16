@@ -141,6 +141,8 @@ export type Reminder = {
   message: string;
   /** true = 每天重复（触发后自动顺延 24 小时） */
   daily?: boolean;
+  /** 每周重复的星期几：0=周日, 1=周一 … 6=周六（如 [1,3,5] 周一三五） */
+  weeklyDays?: number[];
   done?: boolean;
 };
 
