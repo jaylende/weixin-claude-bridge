@@ -1,6 +1,6 @@
-' Weixin-Claude bridge keep-alive - completely windowless.
-' Self-elevates once (silent on this machine), then runs the restart loop
-' inside wscript itself, so there is NO window to close. Ever.
+' Weixin-Claude bridge keep-alive - completely windowless and portable.
+' Self-elevates once (silent on machines with UAC auto-elevate), then runs
+' the restart loop inside wscript itself, so there is NO window to close.
 ' Double-click this file to start the bridge silently.
 
 Function IsElevated()
@@ -22,9 +22,12 @@ If Not IsElevated() Then
     WScript.Quit
 End If
 
+Dim fso : Set fso = CreateObject("Scripting.FileSystemObject")
+Dim scriptDir : scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+
 Dim sh : Set sh = CreateObject("WScript.Shell")
 Do
     ' Run the bridge; window style 0 = hidden. Waits until it exits.
-    sh.Run "cmd /c cd /d C:\Users\Jaylen\weixin-claude-bridge && call ""C:\Program Files\nodejs\npm.cmd"" start >> ""state\bridge-run.log"" 2>&1", 0, True
+    sh.Run "cmd /c cd /d """ & scriptDir & """ && call npm start >> ""state\bridge-run.log"" 2>&1", 0, True
     WScript.Sleep 10000
 Loop

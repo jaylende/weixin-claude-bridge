@@ -5,8 +5,13 @@ import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
-const OMNIPARSER_ROOT = "C:\\Users\\Jaylen\\OmniParser";
-const OMNI_PYTHON = "C:\\Users\\Jaylen\\omni-env\\Scripts\\python.exe";
+// OmniParser 安装位置：OMNIPARSER_ROOT 环境变量可覆盖；
+// 默认按安装指引放在用户主目录（C:\Users\<你>\OmniParser 与 C:\Users\<你>\omni-env）。
+const OMNIPARSER_ROOT =
+  process.env.OMNIPARSER_ROOT || path.join(process.env.USERPROFILE || process.env.HOME || "C:\\", "OmniParser");
+const OMNI_PYTHON =
+  process.env.OMNI_PYTHON ||
+  path.join(process.env.USERPROFILE || process.env.HOME || "C:\\", "omni-env", "Scripts", "python.exe");
 const OMNI_SERVER_DIR = path.join(OMNIPARSER_ROOT, "omnitool", "omniparserserver");
 const OMNI_URL = "http://127.0.0.1:8000";
 const OMNI_PORT = 8000;
