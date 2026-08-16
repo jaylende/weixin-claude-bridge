@@ -40,6 +40,7 @@ const SYSTEM_PROMPT = [
   "- 找目标元素（按钮/图标）时最多用 see_screen 看屏 2 次：第一次定位坐标，第二次确认点击结果。若 2 次后仍找不到目标或点击无效，立即调用 request_user_help 请用户圈选，不要继续反复尝试。",
   "- 【新手引导】如果这是用户第一次和你对话（此前没有任何聊天记录），先简短自我介绍并说明你能做什么：日常聊天、接收/生成文件（Word/Excel/PDF/图表）、图片识别、网络搜索、控制电脑。最后提示「发文件或直接说需求即可」。之后再正常回答用户的问题。",
   "- 【课程表联动】用户发课程表（图片或文件）并要求提醒时：先读取课程表内容，解析出每门课的名称/教室/星期/上课时间，把完整课程表存为一条便签（add_note），然后为每节课单独设置每周重复提醒（set_reminder，at 填上课时间往前倒 20 分钟的时间，weekly 填对应的星期几，message 包含课程名和教室）。如果用户没特别说提前量，默认课前 20 分钟。",
+  "- 【远程取文件】用户说「把 xx 文件发我」时：先用 find_files 按关键词定位（默认搜桌面/下载/文档），找到唯一匹配就直接 send_file_to_user 发送；多个候选时把列表给用户确认要哪个；找不到就询问文件大概在哪个目录再搜。",
 ].join("\n");
 
 /**
@@ -197,6 +198,31 @@ const TOOLS: Anthropic.Tool[] = [
     },
   },
   {
+    name: "find_files",
+    description:
+      "在电脑上搜索用户要的文件（按文件名关键词）。搜索范围：桌面、下载、文档目录（或用 dir 指定目录）。用户说「把 xx 文件发我」「找一下 xx」时先用这个定位文件。",
+    input_schema: {
+      type: "object",
+      properties: {
+        keywords: { type: "string", description: "文件名关键词，多个用空格分隔（任一匹配即可）" },
+        dir: { type: "string", description: "可选：指定搜索目录的绝对路径" },
+      },
+      required: ["keywords"],
+    },
+  },
+  {
+    name: "send_file_to_user",
+    description:
+      "把电脑上的指定文件发送给微信用户（先用 find_files 定位文件路径）。",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "文件的绝对路径" },
+      },
+      required: ["path"],
+    },
+  },
+  {
     name: "web_search",
     description:
       "搜索网络获取最新信息（时事新闻、实时数据、不确定的事实等）。涉及最新/实时信息时必须先搜索再回答，不要凭训练记忆编造。",
@@ -307,6 +333,70 @@ async function executeRequestUserHelp(): Promise<string> {
 
 /** 主动截图：存到指定路径，桥检测后发给用户。 */
 export const SEND_SCREEN_PATH = path.join(process.env.BRIDGE_STATE_DIR || "state", "tmp", "send_screen.png");
+
+/** 待发送给用户的电脑文件（send_file_to_user 工具收集，桥在回复后发送）。 */
+export const pendingSendFiles: string[] = [];
+
+/** 搜索电脑文件（桌面/下载/文档），返回候选列表。 */
+async function executeFindFiles(input: { keywords?: string; dir?: string }): Promise<string> {
+  const keywords = String(input.keywords ?? "").trim();
+  if (!keywords) return "错误：缺少 keywords";
+  const script = [
+    "import os, sys, json, time",
+    "keywords = sys.argv[1].lower().split()",
+    "base = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None",
+    "roots = [base] if base else [os.path.expanduser(p) for p in ['~/Desktop', '~/Downloads', '~/Documents']]",
+    "results = []",
+    "deadline = time.time() + 15",
+    "for root in roots:",
+    "    if not os.path.isdir(root):",
+    "        continue",
+    "    for dirpath, dirs, files in os.walk(root):",
+    "        if time.time() > deadline:",
+    "            break",
+    "        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', 'AppData', 'OneDrive')]",
+    "        for f in files:",
+    "            if any(k in f.lower() for k in keywords):",
+    "                p = os.path.join(dirpath, f)",
+    "                try:",
+    "                    st = os.stat(p)",
+    "                    results.append((p, st.st_size, int(st.st_mtime)))",
+    "                except Exception:",
+    "                    pass",
+    "        if len(results) >= 30:",
+    "            break",
+    "    if len(results) >= 30:",
+    "        break",
+    "results.sort(key=lambda x: -x[2])",
+    "print(json.dumps(results[:20], ensure_ascii=False))",
+  ].join("\n");
+  const tmpDir = path.join(process.env.BRIDGE_STATE_DIR || "state", "tmp");
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const scriptPath = path.join(tmpDir, "_find_files.py");
+  fs.writeFileSync(scriptPath, script, "utf-8");
+  try {
+    const out = execFileSync("python", [scriptPath, keywords, input.dir ?? ""], {
+      timeout: 30_000,
+      encoding: "utf-8",
+      maxBuffer: 5 * 1024 * 1024,
+      windowsHide: true,
+    });
+    const list = JSON.parse(out.trim() || "[]") as [string, number, number][];
+    if (!list.length) return "（没有找到匹配的文件，可以询问用户大概放在哪个目录）";
+    return (
+      "找到以下候选文件（按修改时间排序）：\n" +
+      list
+        .map(([p, size, mt]) => `${p}\n  大小 ${(size / 1024).toFixed(0)}KB | 修改 ${new Date(mt * 1000).toLocaleString("zh-CN", { hour12: false })}`)
+        .join("\n")
+    );
+  } finally {
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch {
+      // best-effort
+    }
+  }
+}
 
 async function executeSendScreenshot(): Promise<string> {
   fs.mkdirSync(path.dirname(SEND_SCREEN_PATH), { recursive: true });
@@ -716,6 +806,18 @@ export async function askClaude(
           } else if (block.name === "cancel_reminder") {
             const id = Number((block.input as { id?: number }).id);
             resultText = removeReminder(id) ? `已取消提醒 #${id}` : `未找到提醒 #${id}`;
+          } else if (block.name === "find_files") {
+            resultText = await executeFindFiles(block.input as { keywords?: string; dir?: string });
+          } else if (block.name === "send_file_to_user") {
+            const filePath = String((block.input as { path?: string }).path ?? "").trim();
+            if (!filePath) {
+              resultText = "错误：缺少 path";
+            } else if (!fs.existsSync(filePath)) {
+              resultText = `文件不存在：${filePath}`;
+            } else {
+              pendingSendFiles.push(filePath);
+              resultText = `文件已加入发送队列：${filePath}`;
+            }
           } else if (block.name === "read_pdf_pages") {
             resultText = await executeReadPdfPages(block.input as { path?: string });
           } else if (block.name === "web_search") {

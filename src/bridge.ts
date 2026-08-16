@@ -24,7 +24,7 @@ import {
   loadReminders,
   saveReminders,
 } from "./state.js";
-import { askClaude, HELP_SCREEN_PATH, SEND_SCREEN_PATH } from "./chat.js";
+import { askClaude, HELP_SCREEN_PATH, SEND_SCREEN_PATH, pendingSendFiles } from "./chat.js";
 import type { ImageInput } from "./chat.js";
 import sharp from "sharp";
 import { startProgressServer, emitProgress } from "./progress.js";
@@ -526,6 +526,39 @@ async function handleMessage(
     }
   } catch (err) {
     logger.warn(`屏幕截图发送失败: ${String(err)}`);
+  }
+
+  // 远程取文件：模型标记的电脑文件逐个发回微信
+  const MAX_SEND_FILE_BYTES = 200 * 1024 * 1024;
+  for (const filePath of pendingSendFiles.splice(0)) {
+    if (!fs.existsSync(filePath)) {
+      logger.warn(`跳过不存在的文件 from=${from} file=${filePath}`);
+      continue;
+    }
+    const size = fs.statSync(filePath).size;
+    if (size > MAX_SEND_FILE_BYTES) {
+      await sendMessageApi({
+        baseUrl: opts.baseUrl,
+        token: opts.token,
+        body: buildTextSendBody(from, `文件 ${path.basename(filePath)} 太大（${(size / 1024 / 1024).toFixed(0)}MB > 200MB），无法发送`, contextToken),
+      }).catch(() => {});
+      continue;
+    }
+    emitProgress("file_sending", path.basename(filePath));
+    try {
+      await sendWeixinMediaFile({
+        filePath,
+        to: from,
+        text: "",
+        opts: { baseUrl: opts.baseUrl, token: opts.token, contextToken },
+        cdnBaseUrl: CDN_BASE_URL,
+      });
+      logger.info(`电脑文件已发回微信 from=${from} file=${filePath}`);
+      emitProgress("file_sent", path.basename(filePath));
+    } catch (err) {
+      logger.error(`电脑文件发送失败 from=${from} file=${filePath}: ${String(err)}`);
+      emitProgress("error", `文件发送失败 ${path.basename(filePath)}`);
+    }
   }
 
   // 生成的文件逐个发回微信（已不存在的跳过——模型可能中途重命名/删除）
